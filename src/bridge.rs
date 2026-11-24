@@ -101,6 +101,10 @@ pub struct BusState {
     /// value of each register and when it was accepted. New partial updates
     /// build on these so back-to-back requests do not undo each other.
     pub pending: HashMap<RegKey, Pending>,
+    /// Accepted writes still in the command channel (not yet drained into
+    /// the session), per register. Updated under this lock by `submit` and
+    /// the drain, so drop handling can see them.
+    pub(crate) in_channel: HashMap<RegKey, u32>,
     pub stats: Stats,
 }
 
@@ -147,6 +151,7 @@ impl BusState {
             last_ping: None,
             first_seen: HashMap::new(),
             pending: HashMap::new(),
+            in_channel: HashMap::new(),
             stats: Stats::default(),
         }
     }
@@ -190,6 +195,16 @@ impl BusState {
         }
         self.registers.insert(key, r);
         true
+    }
+}
+
+fn take_from_channel(st: &mut BusState, r: &Record) {
+    let key = key_of(r);
+    if let Some(n) = st.in_channel.get_mut(&key) {
+        *n -= 1;
+        if *n == 0 {
+            st.in_channel.remove(&key);
+        }
     }
 }
 
@@ -293,6 +308,7 @@ impl Handle {
             self.tx
                 .send(r)
                 .map_err(|_| SubmitError::Write(WriteError::Disconnected))?;
+            *st.in_channel.entry(key_of(&r)).or_default() += 1;
             st.pending.insert(
                 key_of(&r),
                 Pending {
@@ -545,13 +561,15 @@ impl Bridge {
     }
 
     fn drain_commands(&mut self) {
-        let mut n = 0;
+        // Under the state lock, so `submit` cannot interleave between a
+        // write leaving the channel and its count being updated.
+        let mut st = lock(&self.state);
         while let Ok(r) = self.commands.try_recv() {
             log_info!("write queued: {}", crate::describe(&r));
+            take_from_channel(&mut st, &r);
             self.session.queue_write(r);
-            n += 1;
+            st.stats.writes_queued += 1;
         }
-        self.state().stats.writes_queued += n;
     }
 
     fn process_events(&mut self, now: Instant) {
@@ -570,10 +588,10 @@ impl Bridge {
                     st.stats.writes_dropped += v.len() as u64;
                     for r in &v {
                         // Keep it while a write to the register is still
-                        // queued or in flight (a newer, possibly identical,
-                        // submission).
+                        // queued, in flight, or waiting in the command
+                        // channel (a newer, possibly identical, submission).
                         let key = key_of(r);
-                        if !self.session.has_write_for(&key) {
+                        if !self.session.has_write_for(&key) && !st.in_channel.contains_key(&key) {
                             st.pending.remove(&key);
                         }
                     }
@@ -584,17 +602,15 @@ impl Bridge {
                     );
                 }
                 Event::WriteConfirmed(v) => {
+                    // Only mark it: the session emits this before the same
+                    // reply's register reports, and those (or later ones)
+                    // clear it in `observe` once they reflect the value. An
+                    // earlier report may predate the write.
                     for r in &v {
-                        let key = key_of(r);
-                        let reflected = st.registers.get(&key).is_some_and(|cur| reflects(r, cur));
-                        if let Some(p) = st.pending.get_mut(&key) {
+                        if let Some(p) = st.pending.get_mut(&key_of(r)) {
                             if p.record == *r {
                                 p.confirmed = true;
                             }
-                        }
-                        // Already reported before the confirmation? Done.
-                        if reflected && st.pending.get(&key).is_some_and(|p| p.confirmed) {
-                            st.pending.remove(&key);
                         }
                     }
                 }
@@ -648,7 +664,10 @@ impl Bridge {
         drop(st);
         if self.mode == TxMode::ListenOnly {
             // Handle refuses writes in this mode; discard any that raced in.
-            while self.commands.try_recv().is_ok() {}
+            let mut st = lock(&self.state);
+            while let Ok(r) = self.commands.try_recv() {
+                take_from_channel(&mut st, &r);
+            }
         }
     }
 }
@@ -1064,6 +1083,60 @@ mod tests {
             b.on_bytes(&encode("Ping"), t);
         }
         assert!(h.snapshot().pending.is_empty());
+    }
+
+    #[test]
+    fn confirmation_waits_for_a_reflecting_report_in_or_after_its_reply() {
+        // Send off, queue on; off is confirmed with a stale "on" report, then
+        // on is confirmed with an (older) "off" report.
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        let t = Instant::now();
+        h.queue_write(rec(OFF)).unwrap();
+        assert_eq!(
+            b.on_bytes(&encode("Ping"), t),
+            Some(encode(&format!("setCAN {OFF}")))
+        );
+        h.queue_write(rec(ON)).unwrap();
+        b.on_bytes(&report("01010330000100"), t); // confirms off, reports on
+        assert_eq!(b.on_bytes(&encode("Ping"), t), Some(encode("ackCAN 1")));
+        assert_eq!(
+            b.on_bytes(&encode("Ping"), t),
+            Some(encode(&format!("setCAN {ON}")))
+        );
+        b.on_bytes(&report("00010330000100"), t); // confirms on, reports off
+        let st = h.snapshot();
+        assert_eq!(st.desired(&KEY, t), Some(&rec(ON)), "accepted on kept");
+        assert!(st.pending[&KEY].confirmed);
+        // A later report showing on clears it.
+        assert_eq!(b.on_bytes(&encode("Ping"), t), Some(encode("ackCAN 1")));
+        b.on_bytes(&report("01010330000100"), t);
+        assert!(h.snapshot().pending.is_empty());
+    }
+
+    #[test]
+    fn drop_keeps_pending_for_a_write_still_in_the_channel() {
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        let t = Instant::now();
+        h.queue_write(rec(OFF)).unwrap();
+        let first = b.on_bytes(&encode("Ping"), t).unwrap();
+        for _ in 0..crate::session::MAX_RETRIES {
+            assert_eq!(b.on_bytes(&encode("Ping"), t), Some(first.clone()));
+        }
+        // The dropping Ping, with a resubmission landing after the drain but
+        // before events are processed (as from another thread).
+        let ping = Frame {
+            payload: "Ping".into(),
+            crc_ok: true,
+        };
+        b.session.on_frame(&ping);
+        h.queue_write(rec(OFF)).unwrap();
+        b.process_events(t);
+        let st = h.snapshot();
+        assert_eq!(st.stats.writes_dropped, 1);
+        assert_eq!(st.desired(&KEY, t), Some(&rec(OFF)), "channel write kept");
+        // It is drained and sent on the next Ping, and the count clears.
+        assert_eq!(b.on_bytes(&encode("Ping"), t), Some(first));
+        assert!(h.snapshot().in_channel.is_empty());
     }
 
     #[test]
