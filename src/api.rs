@@ -9,6 +9,8 @@
 //! and "things") are not offered: their keys are left out of `getSystemData`
 //! so clients do not expose them, and `setAircon` rejects them.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Map, Value};
 
 use crate::bridge::BusState;
@@ -88,6 +90,7 @@ const FRESH_AIR_NAMES: [&str; 3] = ["none", "off", "on"];
 struct View<'a> {
     st: &'a BusState,
     unit: (u8, u32),
+    now: Instant,
 }
 
 impl View<'_> {
@@ -103,6 +106,12 @@ impl View<'_> {
     fn zone(&self, n: u8) -> Option<(ZoneState, &Record)> {
         let r = self.reg(ZoneState::REG, n)?;
         ZoneState::decode(r).ok().map(|z| (z, r))
+    }
+    /// Value a new partial write builds on: pending desired value if any,
+    /// else the confirmed register.
+    fn desired(&self, reg: u8, zone: u8) -> Option<&Record> {
+        self.st
+            .desired(&(self.unit.0, self.unit.1, reg, zone), self.now)
     }
     fn info(&self) -> Option<ZoneInfo> {
         self.reg(ZoneInfo::REG, 0)
@@ -121,17 +130,48 @@ impl View<'_> {
     }
 }
 
-/// The primary unit and its status, or why the API cannot answer yet.
-fn view(st: &BusState) -> Result<View<'_>, String> {
-    let unit = st.unit.ok_or("no aircon unit seen on the bus yet")?;
-    let v = View { st, unit };
-    if v.status().is_none() {
-        return Err("aircon status (register 05) not received yet".into());
+/// How long after the unit is first seen to keep waiting for a complete
+/// picture (register 01, and 03 + 04 for every zone) before answering with
+/// what has arrived. Clients such as Home Assistant only create entities
+/// (zones, motion and signal sensors) on their first successful read.
+pub const DISCOVERY_GRACE: Duration = Duration::from_secs(30);
+
+fn missing(v: &View) -> Option<String> {
+    if v.info().is_none() {
+        return Some("zone configuration (register 01) not received yet".into());
     }
     for n in 1..=v.zone_count() {
         if v.zone(n).is_none() {
-            return Err(format!("zone {n} state (register 03) not received yet"));
+            return Some(format!("zone {n} state (register 03) not received yet"));
         }
+        if v.reg(ZoneConfig::REG, n).is_none() {
+            return Some(format!("zone {n} config (register 04) not received yet"));
+        }
+    }
+    None
+}
+
+/// The primary unit and its status, or why the API cannot answer.
+fn view(st: &BusState, now: Instant) -> Result<View<'_>, String> {
+    let unit = st.unit.ok_or("no aircon unit seen on the bus yet")?;
+    let v = View { st, unit, now };
+    if v.status().is_none() {
+        return Err("aircon status (register 05) not received yet".into());
+    }
+    if let Some(m) = missing(&v) {
+        let since = st.first_seen.get(&unit).copied().unwrap_or(now);
+        if now.saturating_duration_since(since) < DISCOVERY_GRACE {
+            return Err(m);
+        }
+        // Grace over: serve what we have, but never a zone without its state.
+        for n in 1..=v.zone_count() {
+            if v.zone(n).is_none() {
+                return Err(m);
+            }
+        }
+    }
+    if !st.is_online(unit, now) {
+        return Err("aircon unit offline (no registers seen recently)".into());
     }
     Ok(v)
 }
@@ -143,8 +183,8 @@ fn temp(t: f32) -> Value {
 
 /// `GET /getSystemData`. `Err` means the bus has not delivered enough yet;
 /// the server answers 503 so clients retry instead of caching an empty system.
-pub fn system_data(st: &BusState, info: &ApiInfo) -> Result<Value, String> {
-    let v = view(st)?;
+pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value, String> {
+    let v = view(st, now)?;
     let (s, _) = v.status().expect("checked in view");
     let zi = v.info();
     let error = v
@@ -299,7 +339,10 @@ fn write(unit: (u8, u32), register: u8, payload: [u8; 7]) -> Record {
 ///
 /// Accepts both `{"aircons":{"ac1":…}}` (documented form) and `{"ac1":…}`
 /// (what the `advantage_air` Python client sends).
-pub fn set_aircon(query: &str, st: &BusState) -> Result<Vec<Record>, String> {
+/// Partial updates build on pending (accepted but unconfirmed) values, so
+/// back-to-back requests do not undo each other; run it inside
+/// [`Handle::submit`](crate::bridge::Handle::submit) for that to hold.
+pub fn set_aircon(query: &str, st: &BusState, now: Instant) -> Result<Vec<Record>, String> {
     let raw = query_param(query, "json").ok_or("missing json parameter")?;
     let req: Value = serde_json::from_str(&raw).map_err(|e| format!("invalid JSON: {e}"))?;
     let root = as_object(&req, "request")?;
@@ -307,7 +350,7 @@ pub fn set_aircon(query: &str, st: &BusState) -> Result<Vec<Record>, String> {
         Some(a) => as_object(a, "aircons")?,
         None => root,
     };
-    let v = view(st)?;
+    let v = view(st, now)?;
     let mut out = Vec::new();
     for (ac, body) in acs {
         if ac != "ac1" {
@@ -332,7 +375,8 @@ fn info_write(v: &View, fields: &Map<String, Value>) -> Result<Option<Record>, S
     if fields.is_empty() {
         return Ok(None);
     }
-    let (cur, rec) = v.status().expect("checked in view");
+    let rec = v.desired(SystemStatus::REG, 0).expect("checked in view");
+    let cur = SystemStatus::decode(rec).map_err(|e| format!("current status: {e:?}"))?;
     let mut p = rec.payload;
     p[0] = u8::from(cur.on);
     p[1] = cur.mode as u8;
@@ -389,7 +433,8 @@ fn zone_write(v: &View, key: &str, fields: &Map<String, Value>) -> Result<Record
         .and_then(|d| d.parse().ok())
         .filter(|&n| (1..=v.zone_count()).contains(&n))
         .ok_or_else(|| format!("unknown zone {key:?}"))?;
-    let (z, rec) = v.zone(n).expect("checked in view");
+    let rec = v.desired(ZoneState::REG, n).expect("checked in view");
+    let z = ZoneState::decode(rec).map_err(|e| format!("current zone {n}: {e:?}"))?;
     let mut open = z.open;
     let mut percent = z.percent;
     let mut set = rec.payload[3];
@@ -444,6 +489,7 @@ mod tests {
             "0703abcde0501010330000100", // on, cool, high, 24 °C, fresh air off
             "0703abcde0301e40030000000", // zone 1 open 100 %, no sensor
             "0703abcde0302320130150300", // zone 2 closed 50 %, RF sensor, 21.3 °C
+            "0703abcde0401006400000000", // zone 1 config: damper 0–100
             "0703abcde0402056402020050", // zone 2 config: motion 2, config 2, rssi 80
         ];
         b.on_bytes(
@@ -453,13 +499,21 @@ mod tests {
         h.snapshot()
     }
 
+    fn sd(st: &BusState, info: &ApiInfo) -> Result<Value, String> {
+        system_data(st, info, Instant::now())
+    }
+
+    fn sa(query: &str, st: &BusState) -> Result<Vec<Record>, String> {
+        set_aircon(query, st, Instant::now())
+    }
+
     fn q(json: &str) -> String {
         format!("json={json}")
     }
 
     #[test]
     fn system_data_shape() {
-        let d = system_data(&state(), &ApiInfo::default()).unwrap();
+        let d = sd(&state(), &ApiInfo::default()).unwrap();
         let info = &d["aircons"]["ac1"]["info"];
         assert_eq!(info["state"], "on");
         assert_eq!(info["mode"], "cool");
@@ -502,30 +556,94 @@ mod tests {
             aircon_name: "Ducted".into(),
             zone_names: vec!["Living".into(), String::new()],
         };
-        let d = system_data(&state(), &info).unwrap();
+        let d = sd(&state(), &info).unwrap();
         assert_eq!(d["system"]["name"], "Home");
         assert_eq!(d["aircons"]["ac1"]["info"]["name"], "Ducted");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z01"]["name"], "Living");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z02"]["name"], "Zone 2");
     }
 
+    /// Feed records to a listen-only bridge at time `t`.
+    fn fed(t: Instant, recs: &str) -> BusState {
+        let (mut b, h) = Bridge::new(TxMode::ListenOnly, t);
+        b.on_bytes(&encode(&format!("getCAN 1 {recs}")), t);
+        h.snapshot()
+    }
+
     #[test]
-    fn not_ready_until_status_and_zones_seen() {
-        let (_b, h) = Bridge::new(TxMode::ListenOnly, Instant::now());
-        assert!(system_data(&h.snapshot(), &ApiInfo::default()).is_err());
-        let (mut b, h) = Bridge::new(TxMode::ListenOnly, Instant::now());
+    fn not_ready_until_discovery_is_complete() {
+        let t = Instant::now();
+        let info = ApiInfo::default();
+        let (_b, h) = Bridge::new(TxMode::ListenOnly, t);
+        assert!(system_data(&h.snapshot(), &info, t).is_err());
+        // Status only: zone count unknown.
+        let st = fed(t, "0703abcde0501010330000100 0703abcde0301e40030000000");
+        let e = system_data(&st, &info, t).unwrap_err();
+        assert!(e.contains("register 01"), "{e}");
         // Register 01 says 2 zones but only zone 1 has reported.
-        b.on_bytes(
-            &encode("getCAN 1 0703abcde0120020100000000 0703abcde0501010330000100 0703abcde0301e40030000000"),
-            Instant::now(),
+        let st = fed(
+            t,
+            "0703abcde0120020100000000 0703abcde0501010330000100 0703abcde0301e40030000000 0703abcde0401006400000000",
         );
-        let e = system_data(&h.snapshot(), &ApiInfo::default()).unwrap_err();
-        assert!(e.contains("zone 2"), "{e}");
+        let e = system_data(&st, &info, t).unwrap_err();
+        assert!(e.contains("zone 2 state"), "{e}");
+        // Even after the grace period, never a zone without its state.
+        assert!(system_data(&st, &info, t + DISCOVERY_GRACE).is_err());
+    }
+
+    #[test]
+    fn missing_zone_config_waits_then_falls_back() {
+        let t = Instant::now();
+        let info = ApiInfo::default();
+        // All state, no register 04.
+        let st = fed(
+            t,
+            "0703abcde0120010000000000 0703abcde0501010330000100 0703abcde0301e40030000000",
+        );
+        let e = system_data(&st, &info, t).unwrap_err();
+        assert!(e.contains("register 04"), "{e}");
+        let later = t + DISCOVERY_GRACE;
+        let st = BusState {
+            last_seen: st.last_seen.keys().map(|&u| (u, later)).collect(),
+            ..st
+        };
+        let d = system_data(&st, &info, later).unwrap();
+        assert_eq!(d["aircons"]["ac1"]["zones"]["z01"]["rssi"], 0);
+    }
+
+    #[test]
+    fn offline_unit_is_not_served() {
+        let st = state();
+        let later = Instant::now() + crate::bridge::OFFLINE_WIRED;
+        let e = system_data(&st, &ApiInfo::default(), later).unwrap_err();
+        assert!(e.contains("offline"), "{e}");
+        let e = set_aircon(&q(r#"{"ac1":{"info":{"state":"off"}}}"#), &st, later).unwrap_err();
+        assert!(e.contains("offline"), "{e}");
+    }
+
+    #[test]
+    fn partial_updates_build_on_pending_values() {
+        let mut st = state();
+        let now = Instant::now();
+        let w = set_aircon(&q(r#"{"ac1":{"info":{"state":"off"}}}"#), &st, now).unwrap();
+        st.pending
+            .insert(crate::session::key_of(&w[0]), (w[0], now));
+        let w2 = set_aircon(&q(r#"{"ac1":{"info":{"mode":"heat"}}}"#), &st, now).unwrap();
+        // Off from the first request is kept.
+        assert_eq!(w2[0].to_string(), "0701abcde0500020330000100");
+        // getSystemData still shows the confirmed value.
+        let d = system_data(&st, &ApiInfo::default(), now).unwrap();
+        assert_eq!(d["aircons"]["ac1"]["info"]["state"], "on");
+        // A stale pending value is ignored.
+        let late = now + crate::bridge::PENDING_TTL;
+        let w3 = set_aircon(&q(r#"{"ac1":{"info":{"mode":"heat"}}}"#), &st, late);
+        // (unit offline by then only if past 80 s; PENDING_TTL is 30 s)
+        assert_eq!(w3.unwrap()[0].to_string(), "0701abcde0501020330000100");
     }
 
     #[test]
     fn set_info_merges_over_current_status() {
-        let w = set_aircon(
+        let w = sa(
             &q(r#"{"aircons":{"ac1":{"info":{"state":"off","mode":"heat"}}}}"#),
             &state(),
         )
@@ -533,7 +651,7 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].to_string(), "0701abcde0500020330000100");
         // Python-client form, URL-encoded.
-        let w = set_aircon(
+        let w = sa(
             "json=%7B%22ac1%22%3A+%7B%22info%22%3A+%7B%22setTemp%22%3A+22.5%2C+%22fan%22%3A+%22autoAA%22%7D%7D%7D",
             &state(),
         )
@@ -543,7 +661,7 @@ mod tests {
 
     #[test]
     fn set_zones() {
-        let w = set_aircon(
+        let w = sa(
             &q(r#"{"aircons": { "ac1": { "zones" : { "z01": { "value": 80 }, "z02": {"state":"open","setTemp":23} } } } }"#),
             &state(),
         )
@@ -561,13 +679,13 @@ mod tests {
 
     #[test]
     fn my_zone_and_fresh_air() {
-        let w = set_aircon(
+        let w = sa(
             &q(r#"{"ac1":{"info":{"myZone":2,"freshAirStatus":"on"}}}"#),
             &state(),
         )
         .unwrap();
         assert_eq!(w[0].to_string(), "0701abcde0501010330020200");
-        let e = set_aircon(&q(r#"{"ac1":{"info":{"myZone":1}}}"#), &state()).unwrap_err();
+        let e = sa(&q(r#"{"ac1":{"info":{"myZone":1}}}"#), &state()).unwrap_err();
         assert!(e.contains("no temperature sensor"), "{e}");
     }
 
@@ -598,10 +716,10 @@ mod tests {
             ),
             ("{not json", "invalid JSON"),
         ] {
-            let e = set_aircon(&q(json), &st).unwrap_err();
+            let e = sa(&q(json), &st).unwrap_err();
             assert!(e.contains(needle), "{json}: {e}");
         }
-        assert!(set_aircon("x=1", &st).unwrap_err().contains("missing json"));
+        assert!(sa("x=1", &st).unwrap_err().contains("missing json"));
     }
 
     #[test]

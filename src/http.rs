@@ -10,12 +10,12 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
 use crate::api::{self, ApiInfo};
-use crate::bridge::{Handle, WriteError};
+use crate::bridge::Handle;
 use crate::{log_debug, log_info, log_warn};
 
 /// Largest request head accepted.
@@ -35,17 +35,26 @@ pub struct Request {
     pub query: String,
 }
 
-/// Parse a request head. `Ok(None)` means more bytes are needed.
-pub fn parse_request(buf: &[u8]) -> Result<Option<Request>, String> {
+/// Parse a request head. `Ok(None)` means more bytes are needed; `Err`
+/// carries the HTTP status to answer with.
+pub fn parse_request(buf: &[u8]) -> Result<Option<Request>, (u16, String)> {
+    let too_large = || Err((413, "request too large".to_string()));
     let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
         if buf.len() > MAX_REQUEST {
-            return Err("request too large".into());
+            return too_large();
         }
         return Ok(None);
     };
+    // Checked on the complete head too, so the limit does not depend on how
+    // the bytes were split across reads.
+    if end + 4 > MAX_REQUEST {
+        return too_large();
+    }
     let head = String::from_utf8_lossy(&buf[..end]);
     let line = head.lines().next().unwrap_or("");
-    let (method, rest) = line.split_once(' ').ok_or("bad request line")?;
+    let (method, rest) = line
+        .split_once(' ')
+        .ok_or((400, "bad request line".to_string()))?;
     // The target runs to the last " HTTP/": raw JSON may contain spaces.
     let target = match rest.rfind(" HTTP/") {
         Some(i) => &rest[..i],
@@ -57,15 +66,6 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<Request>, String> {
         path: path.to_string(),
         query: query.to_string(),
     }))
-}
-
-fn write_error(e: WriteError) -> String {
-    match e {
-        WriteError::ListenOnly => "ductbridge is in listen-only mode".into(),
-        WriteError::NotReady => "bus session is still starting".into(),
-        WriteError::NotToControlBox => "internal error: bad destination".into(),
-        WriteError::Disconnected => "bus loop stopped".into(),
-    }
 }
 
 /// Handle one request: returns (status, JSON body). `getSystemData` waits
@@ -81,11 +81,11 @@ pub fn route(
     }
     match req.path.as_str() {
         "/getSystemData" => {
-            let deadline = std::time::Instant::now() + ready_wait;
+            let deadline = Instant::now() + ready_wait;
             loop {
-                match api::system_data(&handle.snapshot(), info) {
+                match api::system_data(&handle.snapshot(), info, Instant::now()) {
                     Ok(v) => return (200, v.to_string()),
-                    Err(_) if std::time::Instant::now() < deadline => {
+                    Err(_) if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(100))
                     }
                     Err(e) => return (503, json!({"error": e}).to_string()),
@@ -93,13 +93,16 @@ pub fn route(
             }
         }
         "/setAircon" => {
-            let result = api::set_aircon(&req.query, &handle.snapshot()).and_then(|writes| {
-                for w in writes {
-                    log_info!("API write: {}", crate::describe(&w));
-                    handle.queue_write(w).map_err(write_error)?;
-                }
-                Ok(())
-            });
+            let now = Instant::now();
+            let result = handle
+                .submit(now, |st| {
+                    let writes = api::set_aircon(&req.query, st, now)?;
+                    for w in &writes {
+                        log_info!("API write: {}", crate::describe(w));
+                    }
+                    Ok(writes)
+                })
+                .map_err(|e| e.to_string());
             if let Err(e) = &result {
                 log_warn!("setAircon refused: {e}");
             }
@@ -132,7 +135,9 @@ pub fn response(status: u16, body: &str) -> Vec<u8> {
 }
 
 fn handle_conn(mut s: TcpStream, handle: &Handle, info: &ApiInfo, ready_wait: Duration) {
-    let _ = s.set_read_timeout(Some(IO_TIMEOUT));
+    // One deadline for the whole request head, so a client trickling bytes
+    // cannot hold a connection slot indefinitely.
+    let deadline = Instant::now() + IO_TIMEOUT;
     let _ = s.set_write_timeout(Some(IO_TIMEOUT));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 2048];
@@ -143,7 +148,12 @@ fn handle_conn(mut s: TcpStream, handle: &Handle, info: &ApiInfo, ready_wait: Du
                 break route(&req, handle, info, ready_wait);
             }
             Ok(None) => {}
-            Err(e) => break (413, json!({"error": e}).to_string()),
+            Err((status, e)) => break (status, json!({"error": e}).to_string()),
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || s.set_read_timeout(Some(left)).is_err() {
+            log_debug!("http: request head not received in time");
+            return;
         }
         match s.read(&mut chunk) {
             Ok(0) | Err(_) => return,
@@ -189,7 +199,6 @@ mod tests {
     use crate::bridge::{Bridge, TxMode};
     use crate::frame::encode;
     use std::net::TcpListener;
-    use std::time::Instant;
 
     #[test]
     fn parses_raw_unescaped_json_target() {
@@ -208,8 +217,16 @@ mod tests {
             parse_request(b"GET /getSystemData HTTP/1.1\r\n").unwrap(),
             None
         );
-        assert!(parse_request(&vec![b'a'; MAX_REQUEST + 1]).is_err());
-        assert!(parse_request(b"nonsense\r\n\r\n").is_err());
+        assert_eq!(
+            parse_request(&vec![b'a'; MAX_REQUEST + 1]).unwrap_err().0,
+            413
+        );
+        // A complete but oversized head is refused too.
+        let mut big = b"GET /x?".to_vec();
+        big.resize(MAX_REQUEST, b'a');
+        big.extend_from_slice(b" HTTP/1.1\r\n\r\n");
+        assert_eq!(parse_request(&big).unwrap_err().0, 413);
+        assert_eq!(parse_request(b"nonsense\r\n\r\n").unwrap_err().0, 400);
     }
 
     fn get(addr: std::net::SocketAddr, target: &str) -> (u16, serde_json::Value) {
@@ -246,7 +263,7 @@ mod tests {
             "getCAN 1 0703abcde0602030300000000",
             "Ping",
             "Ping",
-            "getCAN 1 0703abcde0120010000000000 0703abcde0501010330000100 0703abcde0301e40030000000",
+            "getCAN 1 0703abcde0120010000000000 0703abcde0501010330000100 0703abcde0301e40030000000 0703abcde0401006400000000",
             "Ping",
         ] {
             b.on_bytes(&encode(f), t);
@@ -266,12 +283,42 @@ mod tests {
         assert_eq!(d["ack"], false);
         assert!(d["reason"].as_str().unwrap().contains("outside"));
 
-        // The accepted write goes out on the next free slot.
+        // A second partial update before the box confirms the first keeps
+        // the first one's change (off) instead of reverting it.
+        let (_, d) = get(addr, r#"/setAircon?json={"ac1":{"info":{"mode":"heat"}}}"#);
+        assert_eq!(d["ack"], true);
+
+        // The merged write goes out on the next free slot.
         let out = b.on_bytes(&encode("Ping"), t).unwrap();
-        assert_eq!(out, encode("setCAN 0701abcde0500010330000100"));
+        assert_eq!(out, encode("setCAN 0701abcde0500020330000100"));
 
         assert_eq!(get(addr, "/setLights?json={}").1["ack"], false);
         assert_eq!(get(addr, "/nope").0, 404);
+    }
+
+    #[test]
+    fn slow_request_head_is_cut_off() {
+        let (_b, h) = Bridge::new(TxMode::ListenOnly, Instant::now());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, _) = std::thread::scope(|sc| {
+            let srv = sc.spawn(move || {
+                let (s, _) = listener.accept().unwrap();
+                let start = Instant::now();
+                handle_conn(s, &h, &ApiInfo::default(), Duration::ZERO);
+                start.elapsed()
+            });
+            let mut c = TcpStream::connect(addr).unwrap();
+            // Trickle a byte every second; never finish the head.
+            for _ in 0..7 {
+                if c.write_all(b"G").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            (srv.join().unwrap(), ())
+        });
+        assert!(server < IO_TIMEOUT + Duration::from_secs(1), "{server:?}");
     }
 
     #[test]
@@ -289,7 +336,7 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(150));
         b.on_bytes(
-            &encode("getCAN 1 0703abcde0501010330000100 0703abcde0301e40030000000"),
+            &encode("getCAN 1 0703abcde0120010000000000 0703abcde0501010330000100 0703abcde0301e40030000000 0703abcde0401006400000000"),
             t,
         );
         assert_eq!(waiter.join().unwrap(), 200);
@@ -299,7 +346,7 @@ mod tests {
     fn listen_only_refuses_writes() {
         let (mut b, h) = Bridge::new(TxMode::ListenOnly, Instant::now());
         b.on_bytes(
-            &encode("getCAN 1 0703abcde0501010330000100 0703abcde0301e40030000000"),
+            &encode("getCAN 1 0703abcde0120010000000000 0703abcde0501010330000100 0703abcde0301e40030000000 0703abcde0401006400000000"),
             Instant::now(),
         );
         let req = Request {

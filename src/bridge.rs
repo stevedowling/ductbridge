@@ -40,6 +40,9 @@ pub const BUS_SILENT: Duration = Duration::from_secs(5);
 const ECHO_WINDOW: Duration = Duration::from_secs(1);
 /// How often [`Bridge::tick`] logs a counter summary.
 pub const SUMMARY_INTERVAL: Duration = Duration::from_secs(600);
+/// An accepted write counts as the desired value for this long, unless the
+/// control box confirms it or the session drops it first.
+pub const PENDING_TTL: Duration = Duration::from_secs(30);
 /// Minimum gap between repeated warnings about the same condition.
 const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -92,10 +95,37 @@ pub struct BusState {
     /// When each unit's registers were last seen.
     pub last_seen: HashMap<Unit, Instant>,
     pub last_ping: Option<Instant>,
+    /// When each unit's registers were first seen.
+    pub first_seen: HashMap<Unit, Instant>,
+    /// Accepted writes not yet reflected by the control box: the desired
+    /// value of each register and when it was accepted. New partial updates
+    /// build on these so back-to-back requests do not undo each other.
+    pub pending: HashMap<RegKey, (Record, Instant)>,
     pub stats: Stats,
 }
 
+/// Does a record from the box show the value we wrote? Compares only the
+/// bytes a write sets (status: bytes 0–5; zone: damper byte and setpoint).
+fn reflects(write: &Record, read: &Record) -> bool {
+    match write.register {
+        SystemStatus::REG => write.payload[..6] == read.payload[..6],
+        ZoneState::REG => {
+            write.payload[1] == read.payload[1] && write.payload[3] == read.payload[3]
+        }
+        _ => true,
+    }
+}
+
 impl BusState {
+    /// Desired value of a register: a fresh pending write, else the last
+    /// confirmed value.
+    pub fn desired(&self, key: &RegKey, now: Instant) -> Option<&Record> {
+        match self.pending.get(key) {
+            Some((r, t)) if now.saturating_duration_since(*t) < PENDING_TTL => Some(r),
+            _ => self.registers.get(key),
+        }
+    }
+
     fn new(mode: TxMode) -> Self {
         BusState {
             mode,
@@ -104,6 +134,8 @@ impl BusState {
             registers: HashMap::new(),
             last_seen: HashMap::new(),
             last_ping: None,
+            first_seen: HashMap::new(),
+            pending: HashMap::new(),
             stats: Stats::default(),
         }
     }
@@ -126,6 +158,7 @@ impl BusState {
     /// Range-check and store a record from the box. Returns false if invalid.
     fn observe(&mut self, r: Record, now: Instant) -> bool {
         self.last_seen.insert((r.unit_type, r.uid), now);
+        self.first_seen.entry((r.unit_type, r.uid)).or_insert(now);
         if let Err(e) = validate(&r) {
             self.stats.invalid_records += 1;
             log_warn!("invalid record {r} not applied: {e}");
@@ -134,7 +167,11 @@ impl BusState {
         if self.unit.is_none() && r.is_aircon() && r.uid != 0 {
             self.unit = Some((r.unit_type, r.uid));
         }
-        self.registers.insert(key_of(&r), r);
+        let key = key_of(&r);
+        if self.pending.get(&key).is_some_and(|(w, _)| reflects(w, &r)) {
+            self.pending.remove(&key);
+        }
+        self.registers.insert(key, r);
         true
     }
 }
@@ -148,6 +185,33 @@ fn validate(r: &Record) -> Result<(), String> {
         _ => Ok(()),
     };
     res.map_err(|e| format!("{e:?}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitError {
+    /// The request itself was invalid.
+    Rejected(String),
+    Write(WriteError),
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitError::Rejected(r) => f.write_str(r),
+            SubmitError::Write(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            WriteError::ListenOnly => "ductbridge is in listen-only mode",
+            WriteError::NotReady => "bus session is still starting",
+            WriteError::NotToControlBox => "internal error: write not addressed to the control box",
+            WriteError::Disconnected => "bus loop stopped",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,19 +246,39 @@ impl Handle {
     /// Queue a register write for the next free slot. The session merges
     /// writes to the same register and resends until confirmed.
     pub fn queue_write(&self, r: Record) -> Result<(), WriteError> {
-        {
-            let st = lock(&self.state);
-            if st.mode == TxMode::ListenOnly {
-                return Err(WriteError::ListenOnly);
-            }
-            if st.phase != Some(Phase::Steady) {
-                return Err(WriteError::NotReady);
-            }
+        self.submit(Instant::now(), |_| Ok(vec![r]))
+            .map_err(|e| match e {
+                SubmitError::Write(w) => w,
+                SubmitError::Rejected(_) => unreachable!(),
+            })
+    }
+
+    /// Compute writes from the current state and queue them, all under one
+    /// lock, so concurrent requests see each other's pending values. Nothing
+    /// is queued unless `plan` succeeds and writes are allowed.
+    pub fn submit<F>(&self, now: Instant, plan: F) -> Result<(), SubmitError>
+    where
+        F: FnOnce(&BusState) -> Result<Vec<Record>, String>,
+    {
+        let mut st = lock(&self.state);
+        let writes = plan(&st).map_err(SubmitError::Rejected)?;
+        let err = |e| Err(SubmitError::Write(e));
+        if st.mode == TxMode::ListenOnly {
+            return err(WriteError::ListenOnly);
         }
-        if r.dest != DEST_CB {
-            return Err(WriteError::NotToControlBox);
+        if st.phase != Some(Phase::Steady) {
+            return err(WriteError::NotReady);
         }
-        self.tx.send(r).map_err(|_| WriteError::Disconnected)
+        if writes.iter().any(|r| r.dest != DEST_CB) {
+            return err(WriteError::NotToControlBox);
+        }
+        for r in writes {
+            self.tx
+                .send(r)
+                .map_err(|_| SubmitError::Write(WriteError::Disconnected))?;
+            st.pending.insert(key_of(&r), (r, now));
+        }
+        Ok(())
     }
 }
 
@@ -460,6 +544,12 @@ impl Bridge {
                 }
                 Event::WriteDropped(v) => {
                     st.stats.writes_dropped += v.len() as u64;
+                    for r in &v {
+                        // Only if no newer write to the register replaced it.
+                        if st.pending.get(&key_of(r)).is_some_and(|(p, _)| p == r) {
+                            st.pending.remove(&key_of(r));
+                        }
+                    }
                     let list: Vec<String> = v.iter().map(|r| r.to_string()).collect();
                     log_warn!(
                         "control box never confirmed write; dropped: {}",
@@ -847,6 +937,43 @@ mod tests {
         assert_eq!(sent[..5], STARTUP_REPLIES[..5]);
         // Zone 1 merged to its latest value; zone 2 kept.
         assert_eq!(sent[5], format!("setCAN {} {}", zone(1, 40), zone(2, 50)));
+    }
+
+    #[test]
+    fn pending_writes_track_desired_state_until_confirmed() {
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        let t = Instant::now();
+        let key = (0x07, 0xabcde, 0x05, 0);
+        let off = Record::parse("0701abcde0500010330000100").unwrap();
+        h.queue_write(off).unwrap();
+        let st = h.snapshot();
+        assert_eq!(st.desired(&key, t), Some(&off));
+        // Confirmed register is unchanged until the box reflects the write.
+        assert_eq!(st.registers[&key].payload[0], 1);
+        assert_eq!(
+            st.desired(&key, t + PENDING_TTL + Duration::from_secs(1)),
+            st.registers.get(&key)
+        );
+        // A reply that does not match leaves it pending...
+        b.on_bytes(&encode("getCAN 1 0703abcde0501010330000100"), t);
+        assert!(h.snapshot().pending.contains_key(&key));
+        // ...a matching one clears it.
+        b.on_bytes(&encode("getCAN 1 0703abcde0500010330000100"), t);
+        assert!(h.snapshot().pending.is_empty());
+    }
+
+    #[test]
+    fn submit_is_all_or_nothing() {
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        let t = Instant::now();
+        let e = h.submit(t, |_| Err("nope".into())).unwrap_err();
+        assert_eq!(e, SubmitError::Rejected("nope".into()));
+        let mut bad = flush(7, 1);
+        bad.dest = 3;
+        let e = h.submit(t, |_| Ok(vec![flush(7, 2), bad])).unwrap_err();
+        assert_eq!(e, SubmitError::Write(WriteError::NotToControlBox));
+        assert!(h.snapshot().pending.is_empty());
+        assert_eq!(b.on_bytes(&encode("Ping"), t), Some(encode("setCAN ")));
     }
 
     #[test]

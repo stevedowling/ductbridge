@@ -121,7 +121,7 @@ Safety choices already implemented:
 
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
-- Milestone 3 (done): HTTP API. 63 tests passing; smoke-tested end to end
+- Milestone 3 (done): HTTP API. 69 tests passing; smoke-tested end to end
   (fake CB on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -155,9 +155,13 @@ PyPI client. Behaviour worth knowing:
 
 - `getSystemData` returns `aircons.ac1` (one unit), empty `myLights`/
   `myThings`, and a `system` block (`rid` = config `system_id`, which HA uses
-  as unique id; `sysType` "ductbridge"). It answers **503** until register 05
-  and register 03 for every zone (count from register 01) have been seen,
-  waiting up to 3 s first; the Python client does not retry non-200.
+  as unique id; `sysType` "ductbridge"). It answers **503** (after waiting up
+  to 3 s; the Python client does not retry non-200) until discovery is
+  complete: register 05, register 01, and 03 + 04 for every zone. HA only
+  creates entities (zones, motion/RSSI sensors) on its first good read. If
+  01/04 are still missing 30 s after the unit was first seen
+  (`DISCOVERY_GRACE`), it serves what it has, but never a zone without 03.
+  It also answers 503 (and `setAircon` refuses) while the unit is offline.
 - Names are config (`system_name`, `aircon_name`, `zone_names`); the bus has
   none. Zone `type` is 1 when the zone has a sensor (register 03 byte 2 > 0).
 - Wire↔JSON: mode 1 cool, 2 heat, 3 vent, 4 auto, 5 dry; fan off/low/medium/
@@ -169,7 +173,13 @@ PyPI client. Behaviour worth knowing:
   `{"ack":false,"reason":…}`. Reply is always HTTP 200 with `ack`.
 - Tablet-only feature keys are omitted so HA does not create those entities.
 - No optimistic update: `getSystemData` reflects a write once the CB echoes
-  the register (HA's 15 s poll catches up).
+  the register (HA's 15 s poll catches up). But `setAircon` builds on
+  *pending* desired values (`BusState::pending`, set by `Handle::submit`,
+  cleared when the CB reflects the write, the session drops it, or after
+  30 s), so back-to-back partial updates don't undo each other. Planning and
+  queueing happen under one lock.
+- HTTP: one 5 s deadline for the whole request head; 16 KiB cap checked on
+  complete heads too.
 
 ## Next: milestone 4 — install
 
