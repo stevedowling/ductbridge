@@ -64,7 +64,16 @@ fn main() {
                     print(&f);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue
+            }
             Err(e) => {
                 eprintln!("read error: {e}");
                 break;

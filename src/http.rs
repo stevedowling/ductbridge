@@ -182,6 +182,8 @@ pub fn serve_with(listener: TcpListener, handle: Handle, info: ApiInfo, ready_wa
         };
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             active.fetch_sub(1, Ordering::SeqCst);
+            // On the accept thread: never let a slow client block it.
+            let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
             let _ = s.write_all(&response(503, r#"{"error":"busy"}"#));
             continue;
         }

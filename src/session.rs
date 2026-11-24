@@ -24,6 +24,9 @@ pub const MAX_RECORDS: usize = 25;
 pub const MAX_RETRIES: u8 = 3;
 /// Pings to wait for a unit announcement after the global flush.
 const UNIT_WAIT_PINGS: u32 = 10;
+/// Pings after the global flush before giving up on the dump altogether
+/// (e.g. the unit-scoped flush was never confirmed) and going Steady.
+const FLUSH_TIMEOUT_PINGS: u32 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -86,7 +89,12 @@ pub struct Session {
     can2_busy: bool,
     global_flush_sent: bool,
     unit_flush_sent: bool,
+    /// Units already sent a unit-scoped flush during this dump.
+    flushed_units: Vec<(u8, u32)>,
     pings_since_flush: u32,
+    /// `unit` was taken from a register-05 report (only an aircon sends
+    /// system status), not just a firmware/unit announcement.
+    unit_confirmed: bool,
     /// Primary aircon unit: (unit type, uid).
     unit: Option<(u8, u32)>,
     mirror: HashMap<RegKey, Record>,
@@ -109,7 +117,9 @@ impl Session {
             can2_busy: false,
             global_flush_sent: false,
             unit_flush_sent: false,
+            flushed_units: Vec::new(),
             pings_since_flush: 0,
+            unit_confirmed: false,
             unit: None,
             mirror: HashMap::new(),
             events: Vec::new(),
@@ -227,13 +237,29 @@ impl Session {
         if !matches!(r.dest, 0x03 | 0x04) {
             return;
         }
-        if r.is_aircon() && matches!(r.register, 0x06 | 0x0a) && self.unit.is_none() && r.uid != 0 {
-            self.unit = Some((r.unit_type, r.uid));
+        if r.is_aircon() && r.uid != 0 {
+            let u = (r.unit_type, r.uid);
+            // Type 08 also covers RF devices, so an announcement is only a
+            // guess; the unit that reports system status (05) is the aircon.
+            if r.register == 0x05 && !self.unit_confirmed {
+                self.unit = Some(u);
+                self.unit_confirmed = true;
+            } else if matches!(r.register, 0x06 | 0x0a) && self.unit.is_none() {
+                self.unit = Some(u);
+            }
         }
         if r.register == 0x06 {
             self.queue_write(firmware_ack(&r));
-            if self.phase == Phase::Flushing && !self.unit_flush_sent && r.is_aircon() {
+            let u = (r.unit_type, r.uid);
+            if self.phase == Phase::Flushing
+                && r.is_aircon()
+                && r.uid != 0
+                && !self.flushed_units.contains(&u)
+            {
+                // Every announcing unit gets its own flush, so the aircon's
+                // registers arrive even if an RF device announced first.
                 self.queue_write(flush(r.unit_type, r.uid));
+                self.flushed_units.push(u);
                 self.unit_flush_sent = true;
             }
         }
@@ -288,6 +314,10 @@ impl Session {
             self.pings_since_flush += 1;
             if !self.unit_flush_sent && self.pings_since_flush > UNIT_WAIT_PINGS {
                 // No unit announced itself; carry on with what we have.
+                self.set_phase(Phase::Steady);
+            } else if self.pings_since_flush > FLUSH_TIMEOUT_PINGS {
+                // The unit flush was never confirmed (nacked, dropped or
+                // unanswered); don't block writes forever.
                 self.set_phase(Phase::Steady);
             }
         }
@@ -491,6 +521,51 @@ mod tests {
         s.queue_tagged(w, 2);
         let tags: Vec<u64> = s.take_pending_writes().iter().map(|w| w.tag).collect();
         assert_eq!(tags, [2]);
+    }
+
+    #[test]
+    fn goes_steady_if_the_unit_flush_is_never_confirmed() {
+        let mut s = Session::new();
+        ping(&mut s);
+        s.on_frame(&frame("CAN2 in use"));
+        ping(&mut s); // global flush
+        s.on_frame(&frame("getCAN 1 0703abcde0602030100000000"));
+        // The firmware ack + unit flush are nacked every time and dropped.
+        for _ in 0..60 {
+            if ping(&mut s).is_some_and(|p| p.starts_with("setCAN 07")) {
+                s.on_frame(&frame("getCAN 0"));
+            }
+        }
+        assert_eq!(s.phase(), Phase::Steady);
+    }
+
+    #[test]
+    fn primary_unit_is_the_one_reporting_status() {
+        let mut s = Session::new();
+        ping(&mut s);
+        s.on_frame(&frame("CAN2 in use"));
+        ping(&mut s);
+        // An RF device announces before the aircon.
+        s.on_frame(&frame(
+            "getCAN 1 0803fffff0602030500000000 0803abcde0602030400000000",
+        ));
+        assert_eq!(s.unit(), Some((0x08, 0xfffff)));
+        ping(&mut s); // ackCAN
+                      // Both units get firmware acks and their own flush.
+        let sent = ping(&mut s).unwrap();
+        for r in [
+            "0801fffff0700000000000000",
+            "0801fffff0600000000000000",
+            "0801abcde0700000000000000",
+            "0801abcde0600000000000000",
+        ] {
+            assert!(sent.contains(r), "{sent}");
+        }
+        s.on_frame(&frame("getCAN 1 0803abcde0501010330000100"));
+        assert_eq!(s.unit(), Some((0x08, 0xabcde)));
+        // A later status from another unit does not move it again.
+        s.on_frame(&frame("getCAN 1 0803fffff0501010330000100"));
+        assert_eq!(s.unit(), Some((0x08, 0xabcde)));
     }
 
     #[test]

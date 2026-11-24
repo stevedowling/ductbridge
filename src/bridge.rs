@@ -90,6 +90,10 @@ pub struct BusState {
     pub phase: Option<Phase>,
     /// Primary aircon unit, once seen.
     pub unit: Option<Unit>,
+    /// `unit` is the one that reported system status (register 05), not a
+    /// first guess from any aircon-typed record (type 08 also covers RF
+    /// devices).
+    pub(crate) unit_confirmed: bool,
     /// Latest valid value of every register.
     pub registers: HashMap<RegKey, Record>,
     /// When each unit's registers were last seen.
@@ -153,6 +157,7 @@ impl BusState {
             mode,
             phase: None,
             unit: None,
+            unit_confirmed: false,
             registers: HashMap::new(),
             last_seen: HashMap::new(),
             last_ping: None,
@@ -187,8 +192,13 @@ impl BusState {
             log_warn!("invalid record {r} not applied: {e}");
             return false;
         }
-        if self.unit.is_none() && r.is_aircon() && r.uid != 0 {
-            self.unit = Some((r.unit_type, r.uid));
+        if r.is_aircon() && r.uid != 0 {
+            if r.register == SystemStatus::REG && !self.unit_confirmed {
+                self.unit = Some((r.unit_type, r.uid));
+                self.unit_confirmed = true;
+            } else if self.unit.is_none() {
+                self.unit = Some((r.unit_type, r.uid));
+            }
         }
         let key = key_of(&r);
         // A report before our write was confirmed may be stale (or the
@@ -614,9 +624,6 @@ impl Bridge {
                 Event::LegacyXml(x) => log_info!("legacy XML from control box: {x}"),
             }
         }
-        if let Some(u) = self.session.unit() {
-            st.unit = Some(u);
-        }
     }
 
     /// Periodic housekeeping: bus-silence warnings and unit online/offline
@@ -923,10 +930,12 @@ mod tests {
                 Some(encode("getSystemData"))
             );
         }
-        // Trailing whitespace is fine.
-        let (mut b, _h) = Bridge::new(TxMode::Active, t);
-        let bytes = [encode("Ping"), b" \r\n".to_vec()].concat();
-        assert_eq!(b.on_bytes(&bytes, t), Some(encode("getSystemData")));
+        // Trailing whitespace or line noise (no frame start) is fine.
+        for tail in [&b" \r\n"[..], b"\x00", b"\xff\x00 "] {
+            let (mut b, _h) = Bridge::new(TxMode::Active, t);
+            let bytes = [encode("Ping"), tail.to_vec()].concat();
+            assert_eq!(b.on_bytes(&bytes, t), Some(encode("getSystemData")));
+        }
     }
 
     #[test]
@@ -1175,6 +1184,18 @@ mod tests {
         // because the carried write kept seq 1.
         b.on_bytes(&report("00010330000100"), t);
         assert!(h.snapshot().pending.is_empty());
+    }
+
+    #[test]
+    fn api_unit_is_the_one_reporting_status() {
+        let (mut b, h) = Bridge::new(TxMode::ListenOnly, Instant::now());
+        let t = Instant::now();
+        b.on_bytes(&encode("getCAN 1 0803fffff0602030500000000"), t);
+        assert_eq!(h.snapshot().unit, Some((0x08, 0xfffff)));
+        b.on_bytes(&encode("getCAN 1 0803abcde0501010330000100"), t);
+        assert_eq!(h.snapshot().unit, Some((0x08, 0xabcde)));
+        b.on_bytes(&encode("getCAN 1 0803fffff0501010330000100"), t);
+        assert_eq!(h.snapshot().unit, Some((0x08, 0xabcde)));
     }
 
     #[test]

@@ -121,7 +121,7 @@ Safety choices already implemented:
 
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
-- Milestone 3 (done): HTTP API. 78 tests passing; smoke-tested end to end
+- Milestone 3 (done): HTTP API. 81 tests passing; smoke-tested end to end
   (fake CB on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -131,9 +131,15 @@ Bridge behaviour worth knowing (beyond the session rules above):
 
 - Listen-only never calls the session; it learns registers passively from
   `getCAN 1` frames addressed to the tablet. `Handle::queue_write` refuses.
-- Active: only the last Ping in a read is answered, and only if no other
-  input followed it — a frame, a partial frame or a malformed one; whitespace
-  is allowed (slot gone / another tablet). Bad-CRC Pings are ignored.
+- Active: only the last Ping in a read is answered, and only if nothing
+  frame-like (a `<`: a frame, partial or malformed frame) followed it (slot
+  gone / another tablet). Whitespace and line noise without `<` (e.g. a byte
+  from RS-485 driver turnaround) are allowed. Bad-CRC Pings are ignored.
+- Primary unit: the aircon-typed unit that reports register 05 (type 08
+  also covers RF devices, so an announcement is only a first guess). During
+  the dump every announcing aircon-typed unit gets its own unit flush. If
+  the dump never completes (e.g. the unit flush is never confirmed), the
+  session goes Steady after 30 Pings so writes are not blocked.
 - Our own frames read back within 1 s are counted as echoes; any other
   tablet-side frame (`setCAN`/`ackCAN`/`getSystemData`) is counted as
   foreign and warned about (rate-limited). It does not stop transmitting.
@@ -185,7 +191,9 @@ PyPI client. Behaviour worth knowing:
   Anything for an older sequence number is ignored. 30 s TTL as a backstop.
   Carried writes keep their tags across a reset.
 - `json` parameter: parsed raw first (literal `+`), then percent/form-
-  decoded. Keys next to `aircons` are rejected. Zone keys must be the
+  decoded. Keys next to `aircons` are rejected. Range checks apply to
+  client-sent setpoints; an unchanged setpoint is resent as the box reported
+  it. Zone keys must be the
   canonical `z01`–`z10` (aliases like `z1` would write a zone twice).
 - HTTP: one 5 s deadline for the whole request head; 16 KiB cap checked on
   complete heads too.
