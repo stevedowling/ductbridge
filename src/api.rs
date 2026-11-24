@@ -447,11 +447,15 @@ fn info_write(v: &View, fields: &Map<String, Value>) -> Result<Option<Record>, S
 }
 
 fn zone_write(v: &View, key: &str, fields: &Map<String, Value>) -> Result<Record, String> {
+    // Only the canonical keys getSystemData uses ("z01".."z10"): aliases
+    // such as "z1" or "z001" would let one request write a zone twice, the
+    // later write silently replacing the earlier.
     let n: u8 = key
         .strip_prefix('z')
+        .filter(|d| d.len() == 2 && d.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|d| d.parse().ok())
         .filter(|&n| (1..=v.zone_count()).contains(&n))
-        .ok_or_else(|| format!("unknown zone {key:?}"))?;
+        .ok_or_else(|| format!("unknown zone {key:?} (expected z01–z{:02})", v.zone_count()))?;
     let rec = v.desired(ZoneState::REG, n).expect("checked in view");
     let z = ZoneState::decode(rec).map_err(|e| format!("current zone {n}: {e:?}"))?;
     let mut open = z.open;
@@ -746,6 +750,14 @@ mod tests {
             ),
             (r#"{"ac2":{"info":{"state":"on"}}}"#, "unknown aircon"),
             (r#"{"ac1":{"zones":{"z03":{"value":50}}}}"#, "unknown zone"),
+            // Aliases of z01 are refused, so a zone cannot be written twice.
+            (r#"{"ac1":{"zones":{"z1":{"value":50}}}}"#, "unknown zone"),
+            (r#"{"ac1":{"zones":{"z001":{"value":50}}}}"#, "unknown zone"),
+            (
+                r#"{"ac1":{"zones":{"z1":{"value":50},"z01":{"setTemp":20}}}}"#,
+                "unknown zone",
+            ),
+            (r#"{"ac1":{"zones":{"z+1":{"value":50}}}}"#, "unknown zone"),
             (r#"{"ac1":{"zones":{"z01":{"value":101}}}}"#, "0–100"),
             (r#"{"ac1":{"zones":{"z01":{"name":"x"}}}}"#, "unsupported"),
             // All-or-nothing: a good field does not rescue a bad one.

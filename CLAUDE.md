@@ -185,7 +185,8 @@ PyPI client. Behaviour worth knowing:
   Anything for an older sequence number is ignored. 30 s TTL as a backstop.
   Carried writes keep their tags across a reset.
 - `json` parameter: parsed raw first (literal `+`), then percent/form-
-  decoded. Keys next to `aircons` are rejected.
+  decoded. Keys next to `aircons` are rejected. Zone keys must be the
+  canonical `z01`–`z10` (aliases like `z1` would write a zone twice).
 - HTTP: one 5 s deadline for the whole request head; 16 KiB cap checked on
   complete heads too.
 
