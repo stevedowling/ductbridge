@@ -220,6 +220,8 @@ pub struct Bridge {
     /// Decoder counters from before the last reset.
     carry: DecoderStats,
     session: Session,
+    /// Writes taken from a replaced session, re-queued once the new one is Steady.
+    carried_writes: Vec<Record>,
     state: Arc<Mutex<BusState>>,
     commands: Receiver<Record>,
     last_tx: Option<(String, Instant)>,
@@ -247,6 +249,7 @@ impl Bridge {
             decoder: Decoder::new(),
             carry: DecoderStats::default(),
             session: Session::new(),
+            carried_writes: Vec::new(),
             state,
             commands: rx,
             last_tx: None,
@@ -274,6 +277,21 @@ impl Bridge {
         self.carry.truncated += d.truncated;
         self.carry.malformed += d.malformed;
         self.decoder = Decoder::new();
+        // Keep unconfirmed client writes. Firmware acks (07) and flushes (06)
+        // belong to the old session's startup; the new session makes its own.
+        let pending: Vec<Record> = self
+            .session
+            .take_pending_writes()
+            .into_iter()
+            .filter(|r| !matches!(r.register, 0x06 | 0x07))
+            .collect();
+        if !pending.is_empty() {
+            log_info!(
+                "{} unconfirmed write(s) kept; resending once the new session is ready",
+                pending.len()
+            );
+        }
+        self.carried_writes.extend(pending);
         self.session = Session::new();
         self.last_tx = None;
         self.started = now;
@@ -355,6 +373,11 @@ impl Bridge {
             // Writes wait in the channel until the session is ready, so a
             // reset cannot leak them into a new session's startup.
             if self.session.phase() == Phase::Steady {
+                // Older carried writes first, so newer commands to the same
+                // register replace them (latest value wins).
+                for r in self.carried_writes.drain(..) {
+                    self.session.queue_write(r);
+                }
                 self.drain_commands();
             }
             let out = self.session.on_frame(f);
@@ -786,6 +809,43 @@ mod tests {
         // Startup is unchanged; the write goes out only once Steady.
         assert_eq!(sent[..5], STARTUP_REPLIES[..5]);
         assert_eq!(sent[5], "setCAN 0701123450600000000000000");
+    }
+
+    #[test]
+    fn unconfirmed_writes_survive_a_reset() {
+        let zone = |zone, pct| {
+            ZoneState {
+                zone,
+                open: true,
+                percent: pct,
+                sensor_type: 0,
+                set_temp: 22.0,
+                measured_temp: None,
+            }
+            .encode_write(0x07, 0xabcde)
+            .unwrap()
+        };
+        let t = Instant::now();
+        // Sent but never confirmed.
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        h.queue_write(zone(1, 30)).unwrap();
+        let sent = b.on_bytes(&encode("Ping"), t).unwrap();
+        assert_eq!(sent, encode(&format!("setCAN {}", zone(1, 30))));
+        // Drained but waiting behind an ackCAN.
+        b.on_bytes(&encode("getCAN 0"), t);
+        h.queue_write(zone(1, 40)).unwrap();
+        h.queue_write(zone(2, 50)).unwrap();
+        assert_eq!(b.on_bytes(&encode("Ping"), t), Some(encode("ackCAN 1")));
+
+        b.reset(t);
+        let script = startup_script();
+        let chunks: Vec<&str> = script.iter().map(String::as_str).collect();
+        let mut link = MockLink::new(&chunks);
+        run(&mut link, &mut b).unwrap();
+        let sent = link.sent();
+        assert_eq!(sent[..5], STARTUP_REPLIES[..5]);
+        // Zone 1 merged to its latest value; zone 2 kept.
+        assert_eq!(sent[5], format!("setCAN {} {}", zone(1, 40), zone(2, 50)));
     }
 
     #[test]

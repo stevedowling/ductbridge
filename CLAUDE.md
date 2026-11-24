@@ -118,7 +118,7 @@ Safety choices already implemented:
 ## Status
 
 - Milestone 1 (done): protocol core and monitor.
-- Milestone 2 (done): `ductbridge` daemon, packaging, CI. 47 tests passing;
+- Milestone 2 (done): `ductbridge` daemon, packaging, CI. 49 tests passing;
   also smoke-tested end to end against a scripted fake CB on a pty.
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -137,6 +137,9 @@ Bridge behaviour worth knowing (beyond the session rules above):
 - Writes are refused until the session is `Steady` and must have dest 01.
   Channel commands are only drained into the session while it is `Steady`
   (so writes buffered across a reconnect wait for the new session).
+  On reset, unconfirmed client writes (in flight or queued in the old
+  session) are carried over and re-queued once the new session is `Steady`;
+  old-session registers 06/07 are dropped since the new session redoes them.
 - Unknown system-status mode codes decode as auto, not as invalid.
 - On serial errors the daemon reopens the port every 5 s and restarts the
   session; the register mirror, liveness and counters are kept.
