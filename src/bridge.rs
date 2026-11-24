@@ -100,8 +100,19 @@ pub struct BusState {
     /// Accepted writes not yet reflected by the control box: the desired
     /// value of each register and when it was accepted. New partial updates
     /// build on these so back-to-back requests do not undo each other.
-    pub pending: HashMap<RegKey, (Record, Instant)>,
+    pub pending: HashMap<RegKey, Pending>,
     pub stats: Stats,
+}
+
+/// An accepted write's desired value. It stays the base for new partial
+/// updates until the box has both confirmed this write (`getCAN 1` for the
+/// `setCAN` carrying it) and reported a register value that reflects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pending {
+    pub record: Record,
+    pub accepted: Instant,
+    /// The box accepted a `setCAN` carrying exactly this value.
+    pub confirmed: bool,
 }
 
 /// Does a record from the box show the value we wrote? Compares only the
@@ -121,7 +132,7 @@ impl BusState {
     /// confirmed value.
     pub fn desired(&self, key: &RegKey, now: Instant) -> Option<&Record> {
         match self.pending.get(key) {
-            Some((r, t)) if now.saturating_duration_since(*t) < PENDING_TTL => Some(r),
+            Some(p) if now.saturating_duration_since(p.accepted) < PENDING_TTL => Some(&p.record),
             _ => self.registers.get(key),
         }
     }
@@ -168,7 +179,13 @@ impl BusState {
             self.unit = Some((r.unit_type, r.uid));
         }
         let key = key_of(&r);
-        if self.pending.get(&key).is_some_and(|(w, _)| reflects(w, &r)) {
+        // A report before our write was confirmed may be stale (or the
+        // write may still be queued), so only a confirmed write is cleared.
+        if self
+            .pending
+            .get(&key)
+            .is_some_and(|p| p.confirmed && reflects(&p.record, &r))
+        {
             self.pending.remove(&key);
         }
         self.registers.insert(key, r);
@@ -276,7 +293,14 @@ impl Handle {
             self.tx
                 .send(r)
                 .map_err(|_| SubmitError::Write(WriteError::Disconnected))?;
-            st.pending.insert(key_of(&r), (r, now));
+            st.pending.insert(
+                key_of(&r),
+                Pending {
+                    record: r,
+                    accepted: now,
+                    confirmed: false,
+                },
+            );
         }
         Ok(())
     }
@@ -545,9 +569,12 @@ impl Bridge {
                 Event::WriteDropped(v) => {
                     st.stats.writes_dropped += v.len() as u64;
                     for r in &v {
-                        // Only if no newer write to the register replaced it.
-                        if st.pending.get(&key_of(r)).is_some_and(|(p, _)| p == r) {
-                            st.pending.remove(&key_of(r));
+                        // Keep it while a write to the register is still
+                        // queued or in flight (a newer, possibly identical,
+                        // submission).
+                        let key = key_of(r);
+                        if !self.session.has_write_for(&key) {
+                            st.pending.remove(&key);
                         }
                     }
                     let list: Vec<String> = v.iter().map(|r| r.to_string()).collect();
@@ -555,6 +582,21 @@ impl Bridge {
                         "control box never confirmed write; dropped: {}",
                         list.join(" ")
                     );
+                }
+                Event::WriteConfirmed(v) => {
+                    for r in &v {
+                        let key = key_of(r);
+                        let reflected = st.registers.get(&key).is_some_and(|cur| reflects(r, cur));
+                        if let Some(p) = st.pending.get_mut(&key) {
+                            if p.record == *r {
+                                p.confirmed = true;
+                            }
+                        }
+                        // Already reported before the confirmation? Done.
+                        if reflected && st.pending.get(&key).is_some_and(|p| p.confirmed) {
+                            st.pending.remove(&key);
+                        }
+                    }
                 }
                 Event::BadChecksum(p) => log_debug!("ignored frame with bad checksum: {p}"),
                 Event::LegacyXml(x) => log_info!("legacy XML from control box: {x}"),
@@ -939,26 +981,88 @@ mod tests {
         assert_eq!(sent[5], format!("setCAN {} {}", zone(1, 40), zone(2, 50)));
     }
 
+    const ON: &str = "0701abcde0501010330000100";
+    const OFF: &str = "0701abcde0500010330000100";
+    const KEY: RegKey = (0x07, 0xabcde, 0x05, 0);
+
+    fn rec(s: &str) -> Record {
+        Record::parse(s).unwrap()
+    }
+    /// The box's report of register 05 with the given payload.
+    fn report(payload: &str) -> Vec<u8> {
+        encode(&format!("getCAN 1 0703abcde05{payload}"))
+    }
+
     #[test]
-    fn pending_writes_track_desired_state_until_confirmed() {
+    fn pending_clears_only_after_confirmation_and_reflection() {
         let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
         let t = Instant::now();
-        let key = (0x07, 0xabcde, 0x05, 0);
-        let off = Record::parse("0701abcde0500010330000100").unwrap();
-        h.queue_write(off).unwrap();
+        h.queue_write(rec(OFF)).unwrap();
         let st = h.snapshot();
-        assert_eq!(st.desired(&key, t), Some(&off));
+        assert_eq!(st.desired(&KEY, t), Some(&rec(OFF)));
         // Confirmed register is unchanged until the box reflects the write.
-        assert_eq!(st.registers[&key].payload[0], 1);
+        assert_eq!(st.registers[&KEY].payload[0], 1);
         assert_eq!(
-            st.desired(&key, t + PENDING_TTL + Duration::from_secs(1)),
-            st.registers.get(&key)
+            st.desired(&KEY, t + PENDING_TTL + Duration::from_secs(1)),
+            st.registers.get(&KEY)
         );
-        // A reply that does not match leaves it pending...
-        b.on_bytes(&encode("getCAN 1 0703abcde0501010330000100"), t);
-        assert!(h.snapshot().pending.contains_key(&key));
-        // ...a matching one clears it.
-        b.on_bytes(&encode("getCAN 1 0703abcde0500010330000100"), t);
+        // A reflecting report before the write is even sent does not clear it.
+        b.on_bytes(&report("00010330000100"), t);
+        assert!(!h.snapshot().pending[&KEY].confirmed);
+        assert_eq!(b.on_bytes(&encode("Ping"), t), Some(encode("ackCAN 1")));
+        assert_eq!(
+            b.on_bytes(&encode("Ping"), t),
+            Some(encode(&format!("setCAN {OFF}")))
+        );
+        // Confirmed with the new value in the same reply: cleared.
+        b.on_bytes(&report("00010330000100"), t);
+        assert!(h.snapshot().pending.is_empty());
+    }
+
+    #[test]
+    fn stale_report_does_not_clear_a_newer_queued_write() {
+        // on/cool; send off, then queue on again before off is confirmed.
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        let t = Instant::now();
+        h.queue_write(rec(OFF)).unwrap();
+        assert_eq!(
+            b.on_bytes(&encode("Ping"), t),
+            Some(encode(&format!("setCAN {OFF}")))
+        );
+        h.queue_write(rec(ON)).unwrap();
+        // An unconfirming "on" report (nack + stale register) arrives.
+        b.on_bytes(&encode("getCAN 0"), t);
+        assert_eq!(b.on_bytes(&encode("Ping"), t), Some(encode("ackCAN 1")));
+        b.on_bytes(&report("01010330000100"), t);
+        let st = h.snapshot();
+        assert_eq!(st.desired(&KEY, t), Some(&rec(ON)), "queued on kept");
+        assert!(!st.pending[&KEY].confirmed);
+    }
+
+    #[test]
+    fn drop_keeps_pending_while_a_replacement_is_queued() {
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        let t = Instant::now();
+        h.queue_write(rec(OFF)).unwrap();
+        let first = b.on_bytes(&encode("Ping"), t).unwrap();
+        for _ in 0..crate::session::MAX_RETRIES {
+            assert_eq!(b.on_bytes(&encode("Ping"), t), Some(first.clone()));
+        }
+        // Resubmitted (identical) before the old one is dropped.
+        h.queue_write(rec(OFF)).unwrap();
+        // This Ping drops the old write and sends the replacement.
+        assert_eq!(b.on_bytes(&encode("Ping"), t), Some(first));
+        let st = h.snapshot();
+        assert_eq!(st.stats.writes_dropped, 1);
+        assert_eq!(
+            st.desired(&KEY, t),
+            Some(&rec(OFF)),
+            "replacement still pending"
+        );
+        // With nothing queued, a drop does clear it.
+        for _ in 0..=crate::session::MAX_RETRIES {
+            b.on_bytes(&encode("Ping"), t);
+        }
         assert!(h.snapshot().pending.is_empty());
     }
 

@@ -294,12 +294,27 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Value of `name` in a raw query string, decoded.
-pub fn query_param(query: &str, name: &str) -> Option<String> {
+/// Value of `name` in a raw query string, undecoded.
+fn query_param_raw<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-        (percent_decode(k) == name).then(|| percent_decode(v))
+        (percent_decode(k) == name).then_some(v)
     })
+}
+
+/// Value of `name` in a raw query string, decoded.
+pub fn query_param(query: &str, name: &str) -> Option<String> {
+    query_param_raw(query, name).map(percent_decode)
+}
+
+/// The `json` parameter: raw JSON as sent by phone apps (where `+` is a
+/// literal plus, e.g. in `2.4e+1`), else percent/form-decoded.
+fn json_param(query: &str) -> Result<Value, String> {
+    let raw = query_param_raw(query, "json").ok_or("missing json parameter")?;
+    if let Ok(v) = serde_json::from_str(raw) {
+        return Ok(v);
+    }
+    serde_json::from_str(&percent_decode(raw)).map_err(|e| format!("invalid JSON: {e}"))
 }
 
 fn as_temp(v: &Value, what: &str) -> Result<u8, String> {
@@ -343,11 +358,15 @@ fn write(unit: (u8, u32), register: u8, payload: [u8; 7]) -> Record {
 /// back-to-back requests do not undo each other; run it inside
 /// [`Handle::submit`](crate::bridge::Handle::submit) for that to hold.
 pub fn set_aircon(query: &str, st: &BusState, now: Instant) -> Result<Vec<Record>, String> {
-    let raw = query_param(query, "json").ok_or("missing json parameter")?;
-    let req: Value = serde_json::from_str(&raw).map_err(|e| format!("invalid JSON: {e}"))?;
+    let req = json_param(query)?;
     let root = as_object(&req, "request")?;
     let acs = match root.get("aircons") {
-        Some(a) => as_object(a, "aircons")?,
+        Some(a) => {
+            if let Some(k) = root.keys().find(|k| *k != "aircons") {
+                return Err(format!("unsupported key {k:?} next to aircons"));
+            }
+            as_object(a, "aircons")?
+        }
         None => root,
     };
     let v = view(st, now)?;
@@ -626,8 +645,14 @@ mod tests {
         let mut st = state();
         let now = Instant::now();
         let w = set_aircon(&q(r#"{"ac1":{"info":{"state":"off"}}}"#), &st, now).unwrap();
-        st.pending
-            .insert(crate::session::key_of(&w[0]), (w[0], now));
+        st.pending.insert(
+            crate::session::key_of(&w[0]),
+            crate::bridge::Pending {
+                record: w[0],
+                accepted: now,
+                confirmed: false,
+            },
+        );
         let w2 = set_aircon(&q(r#"{"ac1":{"info":{"mode":"heat"}}}"#), &st, now).unwrap();
         // Off from the first request is kept.
         assert_eq!(w2[0].to_string(), "0701abcde0500020330000100");
@@ -657,6 +682,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(w[0].to_string(), "0701abcde050101052d000100");
+    }
+
+    #[test]
+    fn raw_plus_is_literal_but_encoded_form_still_works() {
+        let w = sa(&q(r#"{"ac1":{"info":{"setTemp":2.4e+1}}}"#), &state()).unwrap();
+        assert_eq!(w[0].payload[3], 48);
+        // Form-encoded: '+' is a space and the JSON is percent-encoded.
+        let w = sa(
+            "json=%7B%22ac1%22%3A+%7B%22info%22%3A+%7B%22setTemp%22%3A+2.4e%2B1%7D%7D%7D",
+            &state(),
+        )
+        .unwrap();
+        assert_eq!(w[0].payload[3], 48);
     }
 
     #[test]
@@ -715,6 +753,10 @@ mod tests {
                 "unknown zone",
             ),
             ("{not json", "invalid JSON"),
+            (
+                r#"{"aircons":{"ac1":{"info":{"state":"off"}}},"ac2":{"info":{"state":"on"}}}"#,
+                "next to aircons",
+            ),
         ] {
             let e = sa(&q(json), &st).unwrap_err();
             assert!(e.contains(needle), "{json}: {e}");

@@ -42,6 +42,8 @@ pub enum Event {
     Register(Record),
     /// The box never confirmed these writes.
     WriteDropped(Vec<Record>),
+    /// The box accepted (`getCAN 1`) these writes.
+    WriteConfirmed(Vec<Record>),
     /// A frame with a bad checksum was received and ignored.
     BadChecksum(String),
     /// A legacy XML reply (`<request>…`), passed through untouched.
@@ -127,6 +129,15 @@ impl Session {
         self.queue.push_back(r);
     }
 
+    /// Is a write to this register (and zone) queued or in flight?
+    pub fn has_write_for(&self, key: &RegKey) -> bool {
+        let in_flight = self
+            .in_flight
+            .as_ref()
+            .is_some_and(|f| f.records.iter().any(|r| key_of(r) == *key));
+        in_flight || self.queue.iter().any(|r| key_of(r) == *key)
+    }
+
     /// Remove and return every write not yet confirmed by the box: the
     /// in-flight `setCAN` first, then the queue. Used when the session is
     /// replaced, so the caller can carry them over.
@@ -191,6 +202,8 @@ impl Session {
         }
         // The box accepted whatever we last sent.
         if let Some(done) = self.in_flight.take() {
+            self.events
+                .push(Event::WriteConfirmed(done.records.clone()));
             if self.phase == Phase::Flushing
                 && self.unit_flush_sent
                 && done.records.iter().any(|r| r.register == 0x06)
@@ -430,6 +443,20 @@ mod tests {
         assert_eq!(uids, [1, 2]);
         assert!(s.take_pending_writes().is_empty());
         assert_eq!(ping(&mut s).as_deref(), Some("setCAN "));
+    }
+
+    #[test]
+    fn reports_confirmed_writes_and_queued_keys() {
+        let mut s = synced();
+        let w = crate::registers::flush(0x07, 1);
+        s.queue_write(w);
+        assert!(s.has_write_for(&key_of(&w)));
+        ping(&mut s).unwrap();
+        assert!(s.has_write_for(&key_of(&w))); // in flight
+        s.drain_events();
+        s.on_frame(&frame("getCAN 1 "));
+        assert!(!s.has_write_for(&key_of(&w)));
+        assert!(s.drain_events().contains(&Event::WriteConfirmed(vec![w])));
     }
 
     #[test]

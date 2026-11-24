@@ -121,7 +121,7 @@ Safety choices already implemented:
 
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
-- Milestone 3 (done): HTTP API. 69 tests passing; smoke-tested end to end
+- Milestone 3 (done): HTTP API. 73 tests passing; smoke-tested end to end
   (fake CB on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -174,10 +174,14 @@ PyPI client. Behaviour worth knowing:
 - Tablet-only feature keys are omitted so HA does not create those entities.
 - No optimistic update: `getSystemData` reflects a write once the CB echoes
   the register (HA's 15 s poll catches up). But `setAircon` builds on
-  *pending* desired values (`BusState::pending`, set by `Handle::submit`,
-  cleared when the CB reflects the write, the session drops it, or after
-  30 s), so back-to-back partial updates don't undo each other. Planning and
-  queueing happen under one lock.
+  *pending* desired values (`BusState::pending`, set by `Handle::submit`),
+  so back-to-back partial updates don't undo each other. Planning and
+  queueing happen under one lock. A pending value clears only once the CB
+  has confirmed that exact write (`getCAN 1`, session `WriteConfirmed`)
+  *and* a report reflects it; on a dropped write only if the session has no
+  other write queued/in flight for that register; else after 30 s.
+- `json` parameter: parsed raw first (literal `+`), then percent/form-
+  decoded. Keys next to `aircons` are rejected.
 - HTTP: one 5 s deadline for the whole request head; 16 KiB cap checked on
   complete heads too.
 
