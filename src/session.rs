@@ -41,7 +41,9 @@ pub enum Event {
     /// A register record received from the box.
     Register(Record),
     /// The box never confirmed these writes.
-    WriteDropped(Vec<Record>),
+    WriteDropped(Vec<TaggedWrite>),
+    /// The box accepted (`getCAN 1`) these writes.
+    WriteConfirmed(Vec<TaggedWrite>),
     /// A frame with a bad checksum was received and ignored.
     BadChecksum(String),
     /// A legacy XML reply (`<request>…`), passed through untouched.
@@ -60,9 +62,18 @@ pub fn key_of(r: &Record) -> RegKey {
     (r.unit_type, r.uid, r.register, zone)
 }
 
+/// A write and the caller's tag for it, reported back in
+/// [`Event::WriteConfirmed`] / [`Event::WriteDropped`] so the caller can tell
+/// submissions apart. The session's own writes are tagged 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaggedWrite {
+    pub record: Record,
+    pub tag: u64,
+}
+
 struct InFlight {
     payload: String,
-    records: Vec<Record>,
+    writes: Vec<TaggedWrite>,
     retries: u8,
 }
 
@@ -71,7 +82,7 @@ pub struct Session {
     /// `Some(crc_ok)` when a `getCAN` must be acknowledged on the next ping.
     pending_ack: Option<bool>,
     in_flight: Option<InFlight>,
-    queue: VecDeque<Record>,
+    queue: VecDeque<TaggedWrite>,
     can2_busy: bool,
     global_flush_sent: bool,
     unit_flush_sent: bool,
@@ -122,16 +133,23 @@ impl Session {
     /// Queue a register write. A queued write to the same register (and
     /// zone) is replaced, so only the latest value is sent.
     pub fn queue_write(&mut self, r: Record) {
-        let k = key_of(&r);
-        self.queue.retain(|q| key_of(q) != k);
-        self.queue.push_back(r);
+        self.queue_tagged(r, 0);
+    }
+
+    /// [`queue_write`](Self::queue_write) with a caller tag. A replaced
+    /// queued write is simply superseded (no event): its tag's submission
+    /// lives on in the newer one.
+    pub fn queue_tagged(&mut self, record: Record, tag: u64) {
+        let k = key_of(&record);
+        self.queue.retain(|q| key_of(&q.record) != k);
+        self.queue.push_back(TaggedWrite { record, tag });
     }
 
     /// Remove and return every write not yet confirmed by the box: the
     /// in-flight `setCAN` first, then the queue. Used when the session is
     /// replaced, so the caller can carry them over.
-    pub fn take_pending_writes(&mut self) -> Vec<Record> {
-        let mut out: Vec<Record> = self.in_flight.take().map(|f| f.records).unwrap_or_default();
+    pub fn take_pending_writes(&mut self) -> Vec<TaggedWrite> {
+        let mut out: Vec<TaggedWrite> = self.in_flight.take().map(|f| f.writes).unwrap_or_default();
         out.extend(self.queue.drain(..));
         out
     }
@@ -191,9 +209,10 @@ impl Session {
         }
         // The box accepted whatever we last sent.
         if let Some(done) = self.in_flight.take() {
+            self.events.push(Event::WriteConfirmed(done.writes.clone()));
             if self.phase == Phase::Flushing
                 && self.unit_flush_sent
-                && done.records.iter().any(|r| r.register == 0x06)
+                && done.writes.iter().any(|w| w.record.register == 0x06)
             {
                 self.set_phase(Phase::Steady);
             }
@@ -222,18 +241,18 @@ impl Session {
         self.events.push(Event::Register(r));
     }
 
-    fn send_records(&mut self, records: Vec<Record>) -> String {
+    fn send_records(&mut self, writes: Vec<TaggedWrite>) -> String {
         let payload = format!(
             "setCAN {}",
-            records
+            writes
                 .iter()
-                .map(|r| r.to_string())
+                .map(|w| w.record.to_string())
                 .collect::<Vec<_>>()
                 .join(" ")
         );
         self.in_flight = Some(InFlight {
             payload: payload.clone(),
-            records,
+            writes,
             retries: 0,
         });
         payload
@@ -255,13 +274,16 @@ impl Session {
                 return Some(inf.payload.clone());
             }
             let dropped = self.in_flight.take().unwrap();
-            self.events.push(Event::WriteDropped(dropped.records));
+            self.events.push(Event::WriteDropped(dropped.writes));
         }
         // 4. Start the register dump.
         if self.phase == Phase::Flushing {
             if !self.global_flush_sent {
                 self.global_flush_sent = true;
-                return Some(self.send_records(vec![flush(UNIT_AIRCON, 0)]));
+                return Some(self.send_records(vec![TaggedWrite {
+                    record: flush(UNIT_AIRCON, 0),
+                    tag: 0,
+                }]));
             }
             self.pings_since_flush += 1;
             if !self.unit_flush_sent && self.pings_since_flush > UNIT_WAIT_PINGS {
@@ -272,7 +294,7 @@ impl Session {
         // 5. Queued writes, at most 25 per frame.
         if !self.queue.is_empty() {
             let n = self.queue.len().min(MAX_RECORDS);
-            let batch: Vec<Record> = self.queue.drain(..n).collect();
+            let batch: Vec<TaggedWrite> = self.queue.drain(..n).collect();
             return Some(self.send_records(batch));
         }
         // 6. Empty poll, unless the box said it is busy.
@@ -426,10 +448,49 @@ mod tests {
         s.queue_write(crate::registers::flush(0x07, 1));
         ping(&mut s).unwrap(); // in flight
         s.queue_write(crate::registers::flush(0x07, 2));
-        let uids: Vec<u32> = s.take_pending_writes().iter().map(|r| r.uid).collect();
+        let uids: Vec<u32> = s
+            .take_pending_writes()
+            .iter()
+            .map(|w| w.record.uid)
+            .collect();
         assert_eq!(uids, [1, 2]);
         assert!(s.take_pending_writes().is_empty());
         assert_eq!(ping(&mut s).as_deref(), Some("setCAN "));
+    }
+
+    #[test]
+    fn tags_come_back_on_confirm_and_drop() {
+        let mut s = synced();
+        let a = crate::registers::flush(0x07, 1);
+        let b = crate::registers::flush(0x07, 2);
+        s.queue_tagged(a, 7);
+        ping(&mut s).unwrap();
+        s.drain_events();
+        s.on_frame(&frame("getCAN 1 "));
+        let confirmed = TaggedWrite { record: a, tag: 7 };
+        assert!(s
+            .drain_events()
+            .contains(&Event::WriteConfirmed(vec![confirmed])));
+        ping(&mut s).unwrap(); // ackCAN
+        s.queue_tagged(b, 8);
+        for _ in 0..=MAX_RETRIES {
+            ping(&mut s).unwrap();
+        }
+        ping(&mut s);
+        let dropped = TaggedWrite { record: b, tag: 8 };
+        assert!(s
+            .drain_events()
+            .contains(&Event::WriteDropped(vec![dropped])));
+    }
+
+    #[test]
+    fn a_newer_queued_write_supersedes_the_older_tag() {
+        let mut s = synced();
+        let w = crate::registers::flush(0x07, 1);
+        s.queue_tagged(w, 1);
+        s.queue_tagged(w, 2);
+        let tags: Vec<u64> = s.take_pending_writes().iter().map(|w| w.tag).collect();
+        assert_eq!(tags, [2]);
     }
 
     #[test]

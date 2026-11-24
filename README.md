@@ -11,7 +11,8 @@ control box, so the system keeps working when the tablet fails.
 
 ## Status
 
-**Milestone 2: bus daemon.** Not yet tested against a real control box.
+**Milestone 3: port-2025 HTTP API.** Not yet tested against a real control
+box.
 
 | Piece | State |
 |---|---|
@@ -22,7 +23,7 @@ control box, so the system keeps working when the tablet fails.
 | Session state machine | Done (pure logic, no I/O): negotiate, two-phase flush, `ackCAN 1`/`0`, resend until `getCAN 1` (max 3), max 25 records per `setCAN`, firmware ack, quiet while `CAN2 in use` |
 | `ductbridge-monitor` | Done. Listen-only; never transmits |
 | `ductbridge` bus daemon | Done. Listen-only by default; `--active` replaces the tablet. Reconnects to the serial port, tracks units online/offline, logs every frame at debug level. See [packaging/INSTALL.md](packaging/INSTALL.md) |
-| Local HTTP API on port 2025 (compatible with existing apps and Home Assistant) | Milestone 3 |
+| Local HTTP API on port 2025 | Done. `getSystemData` and `setAircon` (aircon on/off, mode, fan, setpoint, MyZone, fresh air; zone open/close, damper %, setpoint). Tested with the `advantage_air` Python client used by Home Assistant. Tablet-side features (MyAuto, MyTemp, timers, lights) are not offered |
 
 ## Safety
 

@@ -7,12 +7,15 @@
 //! - [`registers`]: typed register fields
 //! - [`session`]: the tablet's side of the bus conversation
 //! - [`bridge`]: session + link + shared state for the API layer
+//! - [`api`]: the tablet's port-2025 JSON API (pure); [`http`]: its server
 //! - [`config`], [`log`]: daemon plumbing
 
+pub mod api;
 pub mod bridge;
 pub mod config;
 pub mod crc;
 pub mod frame;
+pub mod http;
 pub mod log;
 pub mod record;
 pub mod registers;
@@ -29,6 +32,7 @@ pub fn describe(r: &record::Record) -> String {
         0x05 => SystemStatus::decode(r).map(|s| format!("{s:?}")),
         0x03 => ZoneState::decode(r).map(|z| format!("{z:?}")),
         0x01 => ZoneInfo::decode(r).map(|z| format!("{z:?}")),
+        0x04 => ZoneConfig::decode(r).map(|z| format!("{z:?}")),
         0x06 if r.dest != record::DEST_CB => Firmware::decode(r).map(|f| format!("{f:?}")),
         0x06 => Ok("flush request".into()),
         0x07 => Ok("firmware ack".into()),

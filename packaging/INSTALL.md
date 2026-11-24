@@ -85,6 +85,30 @@ bus: stop the service and unplug it.
 
 To roll back: stop the service and plug the tablet back in.
 
+## 7. HTTP API and Home Assistant
+
+The daemon serves the tablet's local API on port 2025 (`http_bind`). Check
+it from another machine on the LAN:
+
+```bash
+curl http://PI_ADDRESS:2025/getSystemData
+```
+
+It answers 503 until the bus has delivered the aircon status and every
+zone's state (a few seconds after start). Set `system_name`, `aircon_name`
+and `zone_names` in `/etc/ductbridge.conf`; the original tablet stored these
+and they are not on the bus.
+
+In Home Assistant, add the **Advantage Air** integration with the Pi's
+address and port 2025. Give the Pi a fixed address (DHCP reservation) first.
+
+In listen-only mode the API is read-only: `setAircon` answers
+`{"ack": false, "reason": "ductbridge is in listen-only mode"}`.
+
+Not supported yet: MyAuto, MyTemp, auto-fan and night-mode presets,
+on/off timers, lights and "things". They are left out of `getSystemData`,
+so Home Assistant does not offer them.
+
 ```bash
 sudo systemctl stop ductbridge
 ```
@@ -94,4 +118,7 @@ sudo systemctl stop ductbridge
 - `no Ping from the control box yet`: wiring, A/B swapped, or wrong port.
 - `Permission denied` opening the port: the service user needs the
   `dialout` group (the unit file adds it).
-- `debug` log level prints every frame received and sent.
+- `debug` log level prints every frame received and sent, and every HTTP
+  request.
+- `cannot listen on 0.0.0.0:2025`: another process has the port, or the
+  address is wrong. The daemon exits and systemd restarts it.

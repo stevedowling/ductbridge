@@ -35,10 +35,12 @@ CH340) at `/dev/ttyUSB0`, run as a systemd service. Binaries are built by CI
 src/crc.rs        CRC-8 for frames
 src/frame.rs      <U>payload</U=xx> encoder + streaming decoder
 src/record.rs     25-hex-char CAN2 register records
-src/registers.rs  typed registers 01, 03, 05, 06, 07, 08, 0a + write builders
+src/registers.rs  typed registers 01, 03, 04, 05, 06, 07, 08, 0a + write builders
 src/session.rs    tablet-side session state machine (pure)
 src/bridge.rs     Bridge (session + decoder + shared BusState, pure on_bytes/tick),
                   Handle for the API layer, run() I/O loop, MockLink tests
+src/api.rs        port-2025 JSON API: getSystemData builder, setAircon → writes (pure)
+src/http.rs       std-only HTTP/1.1 server for the API (parse_request/route pure)
 src/config.rs     defaults < config file < CLI (pure; file reader injected)
 src/log.rs        levelled stderr logging; journald priorities under systemd
 src/lib.rs        module wiring + describe() for logs
@@ -118,8 +120,9 @@ Safety choices already implemented:
 ## Status
 
 - Milestone 1 (done): protocol core and monitor.
-- Milestone 2 (done): `ductbridge` daemon, packaging, CI. 49 tests passing;
-  also smoke-tested end to end against a scripted fake CB on a pty.
+- Milestone 2 (done): `ductbridge` daemon, packaging, CI.
+- Milestone 3 (done): HTTP API. 78 tests passing; smoke-tested end to end
+  (fake CB on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
   vs also answering legacy XML). Code must work with register-only.
@@ -144,18 +147,50 @@ Bridge behaviour worth knowing (beyond the session rules above):
 - On serial errors the daemon reopens the port every 5 s and restarts the
   session; the register mirror, liveness and counters are kept.
 
-## Next: milestone 3 — port-2025 HTTP API
+## Milestone 3 — port-2025 HTTP API (done)
 
-Reproduce the tablet's local API so existing clients work unchanged:
-`GET /getSystemData`, `GET /setAircon?json={…}`, plus zone/MyZone settings
-carried inside `setAircon`. Sources for the JSON shape: aa_interop
-`docs/tablet_api/README.md` and Home Assistant's `advantage_air`
-integration (and its `advantage_air` PyPI client). Known quirk: clients send
-**unescaped JSON in the query string**, so parse the raw query manually rather
-than relying on strict URL decoding. Lights and other "things" endpoints are
-out of scope initially (return empty structures).
+Shape sources: aa_interop `docs/tablet_api/README.md`, Home Assistant's
+`advantage_air` integration and its test fixture, and the `advantage_air`
+PyPI client. Behaviour worth knowing:
 
-## Milestone 4 — install
+- `getSystemData` returns `aircons.ac1` (one unit), empty `myLights`/
+  `myThings`, and a `system` block (`rid` = config `system_id`, which HA uses
+  as unique id; `sysType` "ductbridge"). It answers **503** (after waiting up
+  to 3 s; the Python client does not retry non-200) until discovery is
+  complete: register 05, register 01, and 03 + 04 for every zone. HA only
+  creates entities (zones, motion/RSSI sensors) on its first good read. If
+  01/04 are still missing 30 s after the unit was first seen
+  (`DISCOVERY_GRACE`), it serves what it has, but never a zone without 03.
+  It also answers 503 (and `setAircon` refuses) while the unit is offline.
+- Names are config (`system_name`, `aircon_name`, `zone_names`); the bus has
+  none. Zone `type` is 1 when the zone has a sensor (register 03 byte 2 > 0).
+- Wire↔JSON: mode 1 cool, 2 heat, 3 vent, 4 auto, 5 dry; fan off/low/medium/
+  high/auto/autoAA (0–5); fresh air none/off/on (0–2).
+- `setAircon` accepts `{"aircons":{"ac1":…}}` and the Python client's
+  `{"ac1":…}`; query parsed leniently (raw or percent-encoded). Writes merge
+  over current register values; all-or-nothing; unsupported fields (timers,
+  MyAuto/MyTemp/auto-fan/night mode, names) are rejected with
+  `{"ack":false,"reason":…}`. Reply is always HTTP 200 with `ack`.
+- Tablet-only feature keys are omitted so HA does not create those entities.
+- No optimistic update: `getSystemData` reflects a write once the CB echoes
+  the register (HA's 15 s poll catches up). But `setAircon` builds on
+  *pending* desired values (`BusState::pending`, set by `Handle::submit`),
+  so back-to-back partial updates don't undo each other. Planning and
+  queueing happen under one lock. Each submission gets a sequence number
+  that travels as the write's tag through the channel and the session
+  (`TaggedWrite`; superseded queued writes just lose their tag). Only events
+  for the pending entry's own sequence number touch it: `WriteConfirmed`
+  marks it (no clearing, since earlier reports may predate it), a later
+  reflecting report clears it in `observe`, and `WriteDropped` clears it.
+  Anything for an older sequence number is ignored. 30 s TTL as a backstop.
+  Carried writes keep their tags across a reset.
+- `json` parameter: parsed raw first (literal `+`), then percent/form-
+  decoded. Keys next to `aircons` are rejected. Zone keys must be the
+  canonical `z01`–`z10` (aliases like `z1` would write a zone twice).
+- HTTP: one 5 s deadline for the whole request head; 16 KiB cap checked on
+  complete heads too.
+
+## Next: milestone 4 — install
 
 Multimeter check of pins, connect A/B/GND only, unplug the original tablet
 (keep it as a fallback), run `ductbridge-monitor` first, then the daemon,
