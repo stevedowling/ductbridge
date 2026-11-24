@@ -124,7 +124,7 @@ Safety choices already implemented:
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
 - Milestone 3 (done): HTTP API, then official-app compatibility and the
-  tablet-side features. 106 tests passing; smoke-tested end to end (fake CB
+  tablet-side features. 107 tests passing; smoke-tested end to end (fake CB
   on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -220,14 +220,20 @@ corrupt file → defaults + warning; out-of-range values repaired on load.
 The controller runs `features::evaluate` every 30 s and on every state
 change, and `features::tick_timers` every 60 s, both through
 `Handle::submit` (so nothing runs in listen-only mode or before Steady;
-timers pause then). Local time comes from libc `localtime_r`.
+timers pause then). Local time comes from libc `localtime_r`, and only
+while the kernel reports the clock NTP-synchronised (`adjtimex` ≠
+TIME_ERROR; a Pi has no RTC). Unsynchronised → `evaluate(.., None)`: quiet
+night does not start, a running one waits, and the daemon warns once. The
+service deliberately does not wait for time sync at startup (aircon
+control must not depend on the internet).
 
 - Timers: `countDownToOn/Off` minutes (int or numeric string, ≤ 720); at 0
   turn on/off. Setting one does not clear the other (unverified).
 - Climate control (`climateControlModeEnabled`): when on, cool/heat, not
   quiet, not MyAuto: MyZone = open sensor zone with the largest positive
   error (heat: set − measured; cool: measured − set); else unchanged.
-- MyAuto (`myAutoModeEnabled` + mode "myauto"): the box only sees cool or
+- MyAuto (`myAutoModeEnabled`; mode "myauto" also enables it, as the
+  official app may not send the flag first): the box only sees cool or
   heat; reported as mode "myauto" with `myAutoModeCurrentSetMode`. Targets
   cool 20–32, heat 16–28, gap ≥ 4 (client values rejected if invalid;
   stored invalid values reset to 24/20). Too hot = measured ≥ cool + 0.5

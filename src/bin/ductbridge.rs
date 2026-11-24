@@ -22,17 +22,31 @@ const EVALUATE_EVERY: Duration = Duration::from_secs(30);
 /// On/off timers count in minutes.
 const TIMER_TICK: Duration = Duration::from_secs(60);
 
+/// Is the system clock synchronised (by NTP, e.g. systemd-timesyncd)?
+/// A Pi has no battery-backed clock, so after boot it can be wrong until
+/// NTP has synced.
+fn clock_synced() -> bool {
+    // SAFETY: adjtimex with modes 0 only reads the kernel's clock state.
+    unsafe {
+        let mut tx: libc::timex = std::mem::zeroed();
+        libc::adjtimex(&mut tx) != libc::TIME_ERROR
+    }
+}
+
 /// Local time of day in minutes after midnight (the Pi's clock and time
-/// zone; keep NTP on for quiet night mode).
-fn local_minute() -> u16 {
+/// zone), or `None` if the clock is not synchronised.
+fn local_minute() -> Option<u16> {
+    if !clock_synced() {
+        return None;
+    }
     // SAFETY: time() and localtime_r() with valid pointers; tm is plain data.
     unsafe {
         let t = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {
-            return 12 * 60; // unknown: treat as midday (quiet night idle)
+            return None;
         }
-        (tm.tm_hour * 60 + tm.tm_min) as u16
+        Some((tm.tm_hour * 60 + tm.tm_min) as u16)
     }
 }
 
@@ -52,6 +66,7 @@ fn controller(handle: Handle, state_file: Option<PathBuf>) {
     let mut evaluated = u64::MAX;
     let mut last_eval = Instant::now();
     let mut last_tick = Instant::now();
+    let mut clock_warned = false;
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let now = Instant::now();
@@ -66,6 +81,16 @@ fn controller(handle: Handle, state_file: Option<PathBuf>) {
         if version != evaluated || now.duration_since(last_eval) >= EVALUATE_EVERY {
             last_eval = now;
             let minute = local_minute();
+            let quiet = handle.app().1.quiet_night_enabled;
+            if minute.is_none() && quiet && !clock_warned {
+                log_warn!(
+                    "clock not synchronised (check NTP: timedatectl); quiet night will not start until it is"
+                );
+                clock_warned = true;
+            } else if minute.is_some() && clock_warned {
+                log_info!("clock synchronised");
+                clock_warned = false;
+            }
             report(
                 "features",
                 handle.submit(now, |st| Ok(features::evaluate(st, now, minute))),

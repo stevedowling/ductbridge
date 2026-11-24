@@ -124,8 +124,11 @@ fn in_quiet_window(minute: u16) -> bool {
 }
 
 /// Periodic evaluation of quiet night, MyAuto and climate control.
-/// `minute` is local time in minutes after midnight.
-pub fn evaluate(st: &BusState, now: Instant, minute: u16) -> Plan {
+/// `minute` is local time in minutes after midnight, or `None` when the
+/// clock is not known to be right (not synchronised by NTP): quiet night
+/// then does not start, and a running one waits for the clock (or for
+/// being disabled) before ending.
+pub fn evaluate(st: &BusState, now: Instant, minute: Option<u16>) -> Plan {
     let Ok(v) = view(st, now) else {
         return Plan::default();
     };
@@ -144,10 +147,11 @@ pub fn evaluate(st: &BusState, now: Instant, minute: u16) -> Plan {
     plan
 }
 
-fn quiet_night(v: &View, app: &mut AppState, minute: u16, plan: &mut Plan) {
+fn quiet_night(v: &View, app: &mut AppState, minute: Option<u16>, plan: &mut Plan) {
     let Some(p) = desired_status(v) else { return };
-    let in_window = in_quiet_window(minute);
-    if app.quiet_night_running && (!app.quiet_night_enabled || !in_window) {
+    // Unknown time: neither in nor out of the window.
+    let in_window = minute.map(in_quiet_window);
+    if app.quiet_night_running && (!app.quiet_night_enabled || in_window == Some(false)) {
         // Restore what quiet night replaced; on/off stays as it is now
         // (whether the original also turns the unit off is unverified).
         if let Some(saved) = app.quiet_night_saved.take() {
@@ -176,7 +180,7 @@ fn quiet_night(v: &View, app: &mut AppState, minute: u16, plan: &mut Plan) {
     // is "cool" on the bus). Exact trigger unverified.
     if !app.quiet_night_running
         && app.quiet_night_enabled
-        && in_window
+        && in_window == Some(true)
         && p[0] == 1
         && p[1] == MODE_COOL
     {
@@ -465,12 +469,12 @@ mod tests {
             z(4, true, 100, false, 22.0, None),      // no sensor
         ];
         let st = bus(&s(true, MODE_COOL, 22.0, 2), &zones, cc());
-        let p = evaluate(&st, Instant::now(), NOON);
+        let p = evaluate(&st, Instant::now(), Some(NOON));
         assert_eq!(status_write(&p).unwrap()[4], 1);
         assert!(p.log[0].contains("MyZone 2 -> 1"));
         // Already on the right zone: nothing to do.
         let st = bus(&s(true, MODE_COOL, 22.0, 1), &zones, cc());
-        assert!(evaluate(&st, Instant::now(), NOON).writes.is_empty());
+        assert!(evaluate(&st, Instant::now(), Some(NOON)).writes.is_empty());
         // Heating looks the other way.
         let zones = [
             z(1, true, 100, true, 22.0, Some(21.0)),
@@ -478,13 +482,13 @@ mod tests {
         ];
         let st = bus(&s(true, MODE_HEAT, 22.0, 1), &zones, cc());
         assert_eq!(
-            status_write(&evaluate(&st, Instant::now(), NOON)).unwrap()[4],
+            status_write(&evaluate(&st, Instant::now(), Some(NOON))).unwrap()[4],
             2
         );
         // No zone needs it: MyZone unchanged.
         let zones = [z(1, true, 100, true, 22.0, Some(23.0))];
         let st = bus(&s(true, MODE_HEAT, 22.0, 1), &zones, cc());
-        assert!(evaluate(&st, Instant::now(), NOON).writes.is_empty());
+        assert!(evaluate(&st, Instant::now(), Some(NOON)).writes.is_empty());
     }
 
     #[test]
@@ -495,11 +499,11 @@ mod tests {
         ];
         for status in [s(false, MODE_COOL, 22.0, 2), s(true, MODE_VENT, 22.0, 2)] {
             let st = bus(&status, &zones, cc());
-            assert!(evaluate(&st, Instant::now(), NOON).writes.is_empty());
+            assert!(evaluate(&st, Instant::now(), Some(NOON)).writes.is_empty());
             assert!(!running(&st, Instant::now()).climate_control);
         }
         let st = bus(&s(true, MODE_COOL, 22.0, 2), &zones, AppState::default());
-        assert!(evaluate(&st, Instant::now(), NOON).writes.is_empty());
+        assert!(evaluate(&st, Instant::now(), Some(NOON)).writes.is_empty());
     }
 
     fn my_auto(cooling: bool) -> AppState {
@@ -519,7 +523,7 @@ mod tests {
             z(3, true, 100, false, 20.0, None),
         ];
         let st = bus(&s(true, MODE_HEAT, 20.0, 1), &zones, my_auto(false));
-        let p = evaluate(&st, Instant::now(), NOON);
+        let p = evaluate(&st, Instant::now(), Some(NOON));
         let sw = status_write(&p).unwrap();
         assert_eq!((sw[1], sw[3], sw[4]), (MODE_COOL, wire(24.0), 2));
         assert!(p.app.as_ref().unwrap().my_auto_cooling);
@@ -537,7 +541,7 @@ mod tests {
             z(2, true, 100, true, 24.0, Some(18.0)), // coldest
         ];
         let st = bus(&s(true, MODE_COOL, 24.0, 1), &zones, my_auto(true));
-        let p = evaluate(&st, Instant::now(), NOON);
+        let p = evaluate(&st, Instant::now(), Some(NOON));
         let sw = status_write(&p).unwrap();
         assert_eq!((sw[1], sw[3], sw[4]), (MODE_HEAT, wire(20.0), 2));
         assert!(!p.app.unwrap().my_auto_cooling);
@@ -550,7 +554,7 @@ mod tests {
             z(2, true, 100, true, 24.0, Some(18.0)), // too cold
         ];
         let st = bus(&s(true, MODE_HEAT, 20.0, 2), &zones, my_auto(false));
-        let p = evaluate(&st, Instant::now(), NOON);
+        let p = evaluate(&st, Instant::now(), Some(NOON));
         // Status already heat / 20 °C / coldest zone: no status write needed.
         assert_eq!(status_write(&p), None);
         assert!(p.app.is_none(), "still heating");
@@ -558,12 +562,12 @@ mod tests {
         assert!(p.log.iter().any(|l| l.contains("unverified")));
         // Same tie while cooling stays cooling, MyZone the hottest.
         let st = bus(&s(true, MODE_COOL, 20.0, 2), &zones, my_auto(true));
-        let sw = status_write(&evaluate(&st, Instant::now(), NOON)).unwrap();
+        let sw = status_write(&evaluate(&st, Instant::now(), Some(NOON))).unwrap();
         assert_eq!((sw[1], sw[3], sw[4]), (MODE_COOL, wire(24.0), 1));
         // All in range: keep the sub-mode and its target, MyZone untouched.
         let zones = [z(1, true, 100, true, 24.0, Some(22.0))];
         let st = bus(&s(true, MODE_COOL, 22.0, 1), &zones, my_auto(true));
-        let p = evaluate(&st, Instant::now(), NOON);
+        let p = evaluate(&st, Instant::now(), Some(NOON));
         let sw = status_write(&p).unwrap();
         assert_eq!((sw[1], sw[3], sw[4]), (MODE_COOL, wire(24.0), 1));
     }
@@ -576,7 +580,7 @@ mod tests {
             ..my_auto(true)
         };
         let st = bus(&s(true, MODE_COOL, 22.0, 0), &zones, app);
-        let p = evaluate(&st, Instant::now(), NOON);
+        let p = evaluate(&st, Instant::now(), Some(NOON));
         let a = p.app.as_ref().unwrap();
         assert_eq!((a.my_auto_cool_target, a.my_auto_heat_target), (24.0, 20.0));
         let sw = status_write(&p).unwrap();
@@ -605,10 +609,10 @@ mod tests {
         let status = s(true, MODE_COOL, 23.0, 0);
         let st = bus(&status, &quiet_zones(), quiet());
         // 21:59: not yet (climate control may still act).
-        let p = evaluate(&st, Instant::now(), 21 * 60 + 59);
+        let p = evaluate(&st, Instant::now(), Some(21 * 60 + 59));
         assert!(!p.app.as_ref().is_some_and(|a| a.quiet_night_running));
         // 22:00: starts.
-        let p = evaluate(&st, Instant::now(), QUIET_START);
+        let p = evaluate(&st, Instant::now(), Some(QUIET_START));
         let app = p.app.clone().unwrap();
         assert!(app.quiet_night_running);
         let sw = status_write(&p).unwrap();
@@ -629,11 +633,11 @@ mod tests {
             ..bus(&s(true, MODE_VENT, 16.0, 0), &quiet_zones(), quiet())
         };
         assert!(running(&st, Instant::now()).quiet_night);
-        let p = evaluate(&st, Instant::now(), QUIET_END - 1);
+        let p = evaluate(&st, Instant::now(), Some(QUIET_END - 1));
         assert!(p.writes.is_empty() && p.app.is_none());
 
         // 06:00: restored (mode, setpoint), unit left on.
-        let p = evaluate(&st, Instant::now(), QUIET_END);
+        let p = evaluate(&st, Instant::now(), Some(QUIET_END));
         let sw = status_write(&p).unwrap();
         assert_eq!((sw[0], sw[1], sw[3]), (1, MODE_COOL, wire(23.0)));
         assert!(!p.app.as_ref().unwrap().quiet_night_running);
@@ -643,7 +647,7 @@ mod tests {
     #[test]
     fn quiet_night_restores_zones_and_respects_off() {
         let st = bus(&s(true, MODE_COOL, 23.0, 1), &quiet_zones(), quiet());
-        let started = evaluate(&st, Instant::now(), 23 * 60);
+        let started = evaluate(&st, Instant::now(), Some(23 * 60));
         // MyZone set: system setpoint untouched.
         assert_eq!(status_write(&started).unwrap()[3], wire(23.0));
         let app = started.app.unwrap();
@@ -657,7 +661,7 @@ mod tests {
             app,
             ..bus(&s(false, MODE_VENT, 23.0, 1), &night, quiet())
         };
-        let p = evaluate(&st, Instant::now(), QUIET_END + 1);
+        let p = evaluate(&st, Instant::now(), Some(QUIET_END + 1));
         let sw = status_write(&p).unwrap();
         assert_eq!((sw[0], sw[1]), (0, MODE_COOL), "stays off, mode restored");
         let zw = zone_writes(&p);
@@ -669,21 +673,47 @@ mod tests {
     #[test]
     fn quiet_night_needs_cooling_and_ends_when_disabled() {
         let st = bus(&s(true, MODE_HEAT, 23.0, 0), &quiet_zones(), quiet());
-        let p = evaluate(&st, Instant::now(), 23 * 60);
+        let p = evaluate(&st, Instant::now(), Some(23 * 60));
         assert!(!p.app.is_some_and(|a| a.quiet_night_running));
         let st = bus(&s(false, MODE_COOL, 23.0, 0), &quiet_zones(), quiet());
-        assert!(evaluate(&st, Instant::now(), 23 * 60).writes.is_empty());
+        assert!(evaluate(&st, Instant::now(), Some(23 * 60))
+            .writes
+            .is_empty());
         // Disabled while running: restored at once.
         let st = bus(&s(true, MODE_COOL, 23.0, 0), &quiet_zones(), quiet());
-        let mut app = evaluate(&st, Instant::now(), 23 * 60).app.unwrap();
+        let mut app = evaluate(&st, Instant::now(), Some(23 * 60)).app.unwrap();
         app.quiet_night_enabled = false;
         let st = BusState {
             app,
             ..bus(&s(true, MODE_VENT, 16.0, 0), &quiet_zones(), quiet())
         };
-        let p = evaluate(&st, Instant::now(), 23 * 60 + 5);
+        let p = evaluate(&st, Instant::now(), Some(23 * 60 + 5));
         assert_eq!(status_write(&p).unwrap()[1], MODE_COOL);
         assert!(!p.app.unwrap().quiet_night_running);
+    }
+
+    #[test]
+    fn quiet_night_waits_for_a_synchronised_clock() {
+        let st = bus(&s(true, MODE_COOL, 23.0, 0), &quiet_zones(), quiet());
+        // Unknown time: does not start.
+        let p = evaluate(&st, Instant::now(), None);
+        assert!(!p.app.is_some_and(|a| a.quiet_night_running));
+        // Running and the clock becomes unknown: keeps running...
+        let app = evaluate(&st, Instant::now(), Some(23 * 60)).app.unwrap();
+        let st = BusState {
+            app,
+            ..bus(&s(true, MODE_VENT, 16.0, 0), &quiet_zones(), quiet())
+        };
+        let p = evaluate(&st, Instant::now(), None);
+        assert!(p.writes.is_empty() && p.app.is_none());
+        // ...but disabling still restores at once.
+        let mut app = st.app.clone();
+        app.quiet_night_enabled = false;
+        let st = BusState { app, ..st };
+        assert_eq!(
+            status_write(&evaluate(&st, Instant::now(), None)).unwrap()[1],
+            MODE_COOL
+        );
     }
 
     #[test]
@@ -693,7 +723,7 @@ mod tests {
             ..my_auto(true)
         };
         let st = bus(&s(true, MODE_COOL, 24.0, 0), &quiet_zones(), app);
-        let p = evaluate(&st, Instant::now(), 22 * 60 + 30);
+        let p = evaluate(&st, Instant::now(), Some(22 * 60 + 30));
         let app = p.app.unwrap();
         assert!(app.quiet_night_running);
         let st = BusState {
@@ -706,6 +736,8 @@ mod tests {
         };
         let r = running(&st, Instant::now());
         assert!(r.quiet_night && !r.my_auto && !r.climate_control);
-        assert!(evaluate(&st, Instant::now(), 23 * 60).writes.is_empty());
+        assert!(evaluate(&st, Instant::now(), Some(23 * 60))
+            .writes
+            .is_empty());
     }
 }

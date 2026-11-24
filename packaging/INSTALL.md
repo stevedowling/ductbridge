@@ -109,7 +109,9 @@ Supported tablet-side features (run by ductbridge, settings kept in
 `/var/lib/ductbridge/state.json`): renaming the system, aircon and zones from
 the app; on/off timers; climate control (automatic MyZone); MyAuto; quiet
 night mode (22:00–06:00 by the Pi's clock: check `timedatectl` shows NTP on
-and the right time zone). Not supported: auto-fan, lights and "things".
+and the right time zone). The Pi has no battery-backed clock, so quiet night
+only starts once NTP has synchronised the clock; until then the log says
+"clock not synchronised". Everything else works without internet access. Not supported: auto-fan, lights and "things".
 
 ## 8. Verify on install day
 

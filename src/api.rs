@@ -571,9 +571,9 @@ fn info_write(
             "mode" => {
                 let s = as_str(val, "mode")?;
                 if s == "myauto" {
-                    if !app.my_auto_enabled {
-                        return Err("mode myauto needs myAutoModeEnabled".into());
-                    }
+                    // Selecting the mode enables the feature (the official
+                    // app may not send myAutoModeEnabled first).
+                    app.my_auto_enabled = true;
                     // Start in the box's current mode if it is cool or heat.
                     match p[1] {
                         1 => app.my_auto_cooling = true,
@@ -972,10 +972,6 @@ mod tests {
         for (json, needle) in [
             (r#"{"ac1":{"info":{"setTemp":33}}}"#, "outside"),
             (r#"{"ac1":{"info":{"setTemp":"24"}}}"#, "number"),
-            (
-                r#"{"ac1":{"info":{"mode":"myauto"}}}"#,
-                "needs myAutoModeEnabled",
-            ),
             (r#"{"ac1":{"info":{"fan":"off"}}}"#, "fan"),
             (r#"{"ac1":{"info":{"countDownToOff":721}}}"#, "0–720"),
             (r#"{"ac1":{"info":{"countDownToOn":"soon"}}}"#, "0–720"),
@@ -1161,6 +1157,12 @@ mod tests {
             .app
             .unwrap();
         assert!(!app.my_auto_selected);
+        // Selecting mode myauto alone enables it (the official app may not
+        // send myAutoModeEnabled first).
+        let app = plan(r#"{"ac1":{"info":{"mode":"myauto"}}}"#, &state())
+            .app
+            .unwrap();
+        assert!(app.my_auto_enabled && app.my_auto_selected);
     }
 
     #[test]
