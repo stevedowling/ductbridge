@@ -193,8 +193,8 @@ PyPI client. Behaviour worth knowing:
 - `json` parameter: parsed raw first (literal `+`), then percent/form-
   decoded. Keys next to `aircons` are rejected. Range checks apply to
   client-sent setpoints; an unchanged setpoint is resent as the box reported
-  it. Zone keys must be the
-  canonical `z01`–`z10` (aliases like `z1` would write a zone twice).
+  it. Zone keys must be the canonical `z01`–`z10` (aliases like `z1`
+  would write a zone twice).
 - HTTP: one 5 s deadline for the whole request head; 16 KiB cap checked on
   complete heads too.
 
