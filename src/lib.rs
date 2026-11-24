@@ -14,12 +14,14 @@ pub mod api;
 pub mod bridge;
 pub mod config;
 pub mod crc;
+pub mod features;
 pub mod frame;
 pub mod http;
 pub mod log;
 pub mod record;
 pub mod registers;
 pub mod session;
+pub mod state;
 
 /// Human-readable one-line description of a record, for logs and the monitor.
 pub fn describe(r: &record::Record) -> String {

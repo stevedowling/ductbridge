@@ -6,6 +6,7 @@
 //! ```text
 //! port = "/dev/ttyUSB0"
 //! http_bind = "0.0.0.0:2025"  # or "off"
+//! state_file = "/var/lib/ductbridge/state.json"  # or "off"
 //! mode = "listen-only"     # or "active"
 //! log_level = "info"       # error, warn, info, debug
 //! system_name = "Home"     # names shown by apps (not stored on the bus)
@@ -32,6 +33,7 @@ Options:
   -c, --config PATH      config file (default /etc/ductbridge.conf, if present)
   -p, --port DEVICE      serial device (default /dev/ttyUSB0)
       --http-bind ADDR   HTTP API address (default 0.0.0.0:2025; \"off\" disables)
+      --state-file PATH  tablet-side state (default /var/lib/ductbridge/state.json)
       --listen-only      never transmit (default)
       --active           answer the control box's Pings (replaces the tablet)
       --log-level LEVEL  error, warn, info or debug (default info)
@@ -47,6 +49,9 @@ pub struct Config {
     pub log_level: Level,
     /// Names and id reported by the HTTP API.
     pub api: ApiInfo,
+    /// Persisted tablet-side state (names, timers, features); "off" keeps
+    /// it in memory only.
+    pub state_file: String,
 }
 
 impl Default for Config {
@@ -57,6 +62,7 @@ impl Default for Config {
             mode: TxMode::ListenOnly,
             log_level: Level::Info,
             api: ApiInfo::default(),
+            state_file: "/var/lib/ductbridge/state.json".into(),
         }
     }
 }
@@ -123,6 +129,7 @@ fn set(cfg: &mut Config, key: &str, v: &str) -> Result<(), String> {
     match key {
         "port" => cfg.port = v.to_string(),
         "http_bind" => cfg.http_bind = v.to_string(),
+        "state_file" => cfg.state_file = v.to_string(),
         "system_name" => cfg.api.system_name = v.to_string(),
         "system_id" if v.is_empty() => return Err("system_id must not be empty".into()),
         "system_id" => cfg.api.system_id = v.to_string(),
@@ -173,6 +180,7 @@ where
             "-c" | "--config" => config_path = Some(value(&flag)?.into()),
             "-p" | "--port" => overrides.push(("port".into(), value(&flag)?)),
             "--http-bind" => overrides.push(("http_bind".into(), value(&flag)?)),
+            "--state-file" => overrides.push(("state_file".into(), value(&flag)?)),
             "--log-level" => overrides.push(("log_level".into(), value(&flag)?)),
             "--listen-only" => overrides.push(("mode".into(), "listen-only".into())),
             "--active" => overrides.push(("mode".into(), "active".into())),
@@ -225,6 +233,9 @@ mod tests {
         assert_eq!(c, Config::default());
         assert_eq!(c.mode, TxMode::ListenOnly);
         assert_eq!(c.port, "/dev/ttyUSB0");
+        assert_eq!(c.state_file, "/var/lib/ductbridge/state.json");
+        let c = run("--state-file /tmp/s.json", no_file).unwrap();
+        assert_eq!(c.state_file, "/tmp/s.json");
     }
 
     #[test]

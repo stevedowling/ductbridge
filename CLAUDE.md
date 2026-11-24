@@ -41,6 +41,8 @@ src/bridge.rs     Bridge (session + decoder + shared BusState, pure on_bytes/tic
                   Handle for the API layer, run() I/O loop, MockLink tests
 src/api.rs        port-2025 JSON API: getSystemData builder, setAircon → writes (pure)
 src/http.rs       std-only HTTP/1.1 server for the API (parse_request/route pure)
+src/state.rs      persisted tablet-side state (names, timers, features), atomic save
+src/features.rs   timers, climate control, MyAuto, quiet night (pure: snapshot+time → Plan)
 src/config.rs     defaults < config file < CLI (pure; file reader injected)
 src/log.rs        levelled stderr logging; journald priorities under systemd
 src/lib.rs        module wiring + describe() for logs
@@ -121,8 +123,9 @@ Safety choices already implemented:
 
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
-- Milestone 3 (done): HTTP API. 83 tests passing; smoke-tested end to end
-  (fake CB on a pty + the real `advantage_air` Python client + raw curl).
+- Milestone 3 (done): HTTP API, then official-app compatibility and the
+  tablet-side features. 106 tests passing; smoke-tested end to end (fake CB
+  on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
   vs also answering legacy XML). Code must work with register-only.
@@ -169,16 +172,25 @@ PyPI client. Behaviour worth knowing:
   01/04 are still missing 30 s after the unit was first seen
   (`DISCOVERY_GRACE`), it serves what it has, but never a zone without 03.
   It also answers 503 (and `setAircon` refuses) while the unit is offline.
-- Names are config (`system_name`, `aircon_name`, `zone_names`); the bus has
-  none. Zone `type` is 1 when the zone has a sensor (register 03 byte 2 > 0).
+- Names: set by clients (`info.name`, `zones.zNN.name`, `system.name` in
+  `setAircon`, or `/setMySystem`) and kept in the state file; else config
+  (`system_name`, `aircon_name`, `zone_names`). ≤ 32 chars, control chars
+  stripped. Zone `type` is 1 when the zone has a sensor (03 byte 2 > 0).
+- Official phone app: discovery needs `system.mid` (= `system_id`), `name`
+  and `myAppRev`; `myAppRev` is `15.0+ductbridge.<version>` (the app parses
+  the major and wants ≥ 13). Its zone objects carry `number` (must match the
+  key) and `tempSensorClash` (ignored).
 - Wire↔JSON: mode 1 cool, 2 heat, 3 vent, 4 auto, 5 dry; fan off/low/medium/
   high/auto/autoAA (0–5); fresh air none/off/on (0–2).
 - `setAircon` accepts `{"aircons":{"ac1":…}}` and the Python client's
   `{"ac1":…}`; query parsed leniently (raw or percent-encoded). Writes merge
-  over current register values; all-or-nothing; unsupported fields (timers,
-  MyAuto/MyTemp/auto-fan/night mode, names) are rejected with
-  `{"ack":false,"reason":…}`. Reply is always HTTP 200 with `ack`.
-- Tablet-only feature keys are omitted so HA does not create those entities.
+  over current register values; all-or-nothing; unsupported fields
+  (auto-fan, lights, things) are rejected with `{"ack":false,"reason":…}`.
+  Reply is always HTTP 200 with `ack`. `filterCleanStatus: 0` is accepted
+  and only logged (the bus write is not known yet).
+- `setAircon` / `Handle::submit` return a `Plan`: writes plus an optional
+  new `AppState`, applied together under the state lock (refused as a whole
+  in listen-only mode or before Steady). `app_version` bumps on change.
 - No optimistic update: `getSystemData` reflects a write once the CB echoes
   the register (HA's 15 s poll catches up). But `setAircon` builds on
   *pending* desired values (`BusState::pending`, set by `Handle::submit`),
@@ -198,6 +210,49 @@ PyPI client. Behaviour worth knowing:
   would write a zone twice).
 - HTTP: one 5 s deadline for the whole request head; 16 KiB cap checked on
   complete heads too.
+
+## Tablet-side features
+
+State in `AppState` (`src/state.rs`), persisted to `state_file` (default
+`/var/lib/ductbridge/state.json`; systemd `StateDirectory=ductbridge`) by
+the daemon's controller thread when `app_version` changes. Missing or
+corrupt file → defaults + warning; out-of-range values repaired on load.
+The controller runs `features::evaluate` every 30 s and on every state
+change, and `features::tick_timers` every 60 s, both through
+`Handle::submit` (so nothing runs in listen-only mode or before Steady;
+timers pause then). Local time comes from libc `localtime_r`.
+
+- Timers: `countDownToOn/Off` minutes (int or numeric string, ≤ 720); at 0
+  turn on/off. Setting one does not clear the other (unverified).
+- Climate control (`climateControlModeEnabled`): when on, cool/heat, not
+  quiet, not MyAuto: MyZone = open sensor zone with the largest positive
+  error (heat: set − measured; cool: measured − set); else unchanged.
+- MyAuto (`myAutoModeEnabled` + mode "myauto"): the box only sees cool or
+  heat; reported as mode "myauto" with `myAutoModeCurrentSetMode`. Targets
+  cool 20–32, heat 16–28, gap ≥ 4 (client values rejected if invalid;
+  stored invalid values reset to 24/20). Too hot = measured ≥ cool + 0.5
+  → cool, MyZone hottest, setTemp cool target; too cold = measured < heat →
+  heat, coldest, heat target; both → stay in the current mode (unverified);
+  none → keep. Every sensor zone's setpoint follows the active target. Any
+  other mode, or disabling, leaves MyAuto.
+- Quiet night (`quietNightModeEnabled`): 22:00–06:00 local. Starts when on
+  and cooling (unverified trigger): saves 05 + all 03 payloads, mode vent,
+  setTemp 16 °C if MyZone 0, sensor zones 16 °C, open percent zones 100 %.
+  Written once at start (user changes overnight stick). Ends at 06:00 or
+  when disabled: restores mode/fan/setpoint/MyZone/fresh air and zones,
+  leaves on/off as is (whether the original turns the unit off is
+  unverified). Climate control and MyAuto pause while it runs.
+
+### Verify on install day
+
+Each logs a line containing "unverified" when it acts.
+
+- Timers: setting one leaves the other running.
+- `/setMySystem` is what the app uses to rename the system.
+- MyAuto tie-break (zones too hot and too cold): stays in its current mode.
+- Quiet night start trigger (on + cooling in the window).
+- Quiet night end: restore only vs also turning the unit off.
+- Filter reset: capture the original tablet's bus write, then implement.
 
 ## Next: milestone 4 — install
 
