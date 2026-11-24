@@ -139,6 +139,11 @@ where
                 .ok_or_else(|| format!("{name} needs a value"))
         };
         match flag.as_str() {
+            "-h" | "--help" | "-V" | "--version" | "--listen-only" | "--active"
+                if inline.is_some() =>
+            {
+                return Err(format!("{flag} takes no value"))
+            }
             "-h" | "--help" => return Ok(Action::Help),
             "-V" | "--version" => return Ok(Action::Version),
             "-c" | "--config" => config_path = Some(value(&flag)?.into()),
@@ -240,6 +245,10 @@ mod tests {
             .unwrap_err()
             .contains("needs a value"));
         assert!(run("--log-level loud", no_file).is_err());
+        assert!(run("--active=false", no_file)
+            .unwrap_err()
+            .contains("takes no value"));
+        assert!(run("--listen-only=1", no_file).is_err());
         let bad = |_: &Path| Ok("mode = transmit".to_string());
         assert!(run("", bad).unwrap_err().contains("line 1"));
         let bad = |_: &Path| Ok("colour = blue".to_string());

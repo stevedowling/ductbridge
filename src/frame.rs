@@ -38,6 +38,12 @@ pub struct DecoderStats {
 pub struct Decoder {
     buf: Vec<u8>,
     stats: DecoderStats,
+    /// Non-whitespace bytes received after the end of the last returned frame.
+    trailing: usize,
+}
+
+fn non_ws(b: &[u8]) -> usize {
+    b.iter().filter(|c| !c.is_ascii_whitespace()).count()
 }
 
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -70,7 +76,15 @@ impl Decoder {
     }
 
     /// Add bytes read from the serial port.
+    /// Was anything other than whitespace received after the last frame
+    /// returned by [`next_frame`](Self::next_frame)? Covers partial frames
+    /// still buffered and malformed or noise bytes already discarded.
+    pub fn has_trailing_input(&self) -> bool {
+        self.trailing > 0
+    }
+
     pub fn push(&mut self, bytes: &[u8]) {
+        self.trailing += non_ws(bytes);
         self.buf.extend_from_slice(bytes);
         if self.buf.len() > MAX_BUFFER {
             let cut = self.buf.len() - MAX_BUFFER;
@@ -122,6 +136,7 @@ impl Decoder {
                 self.stats.malformed += 1;
                 continue;
             };
+            self.trailing = non_ws(&self.buf);
             return Some(Frame {
                 crc_ok: crc8(&payload_bytes) == crc,
                 payload: String::from_utf8_lossy(&payload_bytes).into_owned(),
@@ -198,6 +213,22 @@ mod tests {
         assert_eq!(d.next_frame().unwrap().payload, "Ping");
         assert_eq!(d.next_frame(), None);
         assert_eq!(d.stats().truncated, 1);
+    }
+
+    #[test]
+    fn reports_input_after_the_last_frame() {
+        let mut d = Decoder::new();
+        d.push(b"<U>Ping</U=db> \r\n");
+        d.next_frame().unwrap();
+        assert!(!d.has_trailing_input()); // whitespace only
+        d.push(b"<U>setCAN ");
+        assert_eq!(d.next_frame(), None);
+        assert!(d.has_trailing_input()); // partial frame
+        let mut d = Decoder::new();
+        d.push(b"<U>Ping</U=db><U>x</U=zz>");
+        d.next_frame().unwrap();
+        assert_eq!(d.next_frame(), None);
+        assert!(d.has_trailing_input()); // malformed frame, already discarded
     }
 
     #[test]

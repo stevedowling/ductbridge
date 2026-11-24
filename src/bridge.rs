@@ -294,10 +294,13 @@ impl Bridge {
             frames.push(f);
         }
         self.sync_decoder_stats();
+        // Anything after the final frame (even a partial or malformed one)
+        // means the slot is already in use.
+        let trailing = self.decoder.has_trailing_input();
         let n = frames.len();
         let mut reply = None;
         for (i, f) in frames.into_iter().enumerate() {
-            reply = self.on_frame(&f, i + 1 == n, now);
+            reply = self.on_frame(&f, i + 1 == n && !trailing, now);
         }
         let payload = reply?;
         log_debug!("tx {payload}");
@@ -346,10 +349,14 @@ impl Bridge {
             }
             if !last {
                 self.state().stats.missed_slots += 1;
-                log_debug!("Ping slot missed: another frame followed it");
+                log_debug!("Ping slot missed: other input followed it");
                 return None;
             }
-            self.drain_commands();
+            // Writes wait in the channel until the session is ready, so a
+            // reset cannot leak them into a new session's startup.
+            if self.session.phase() == Phase::Steady {
+                self.drain_commands();
+            }
             let out = self.session.on_frame(f);
             self.process_events(now);
             return out;
@@ -731,6 +738,54 @@ mod tests {
         let st = h.snapshot().stats;
         assert_eq!(st.missed_slots, 2);
         assert_eq!(st.foreign_tablet_frames, 1);
+    }
+
+    #[test]
+    fn partial_or_malformed_input_after_ping_suppresses_reply() {
+        let t = Instant::now();
+        for tail in [&b"<U>setCAN "[..], b"<U>setCAN </U=zz>"] {
+            let (mut b, h) = Bridge::new(TxMode::Active, t);
+            let bytes = [encode("Ping"), tail.to_vec()].concat();
+            assert_eq!(b.on_bytes(&bytes, t), None);
+            assert_eq!(h.snapshot().stats.missed_slots, 1);
+            // The session did not advance: the next clean Ping negotiates.
+            b.on_bytes(b"</U=b2>", t);
+            assert_eq!(
+                b.on_bytes(&encode("Ping"), t),
+                Some(encode("getSystemData"))
+            );
+        }
+        // Trailing whitespace is fine.
+        let (mut b, _h) = Bridge::new(TxMode::Active, t);
+        let bytes = [encode("Ping"), b" \r\n".to_vec()].concat();
+        assert_eq!(b.on_bytes(&bytes, t), Some(encode("getSystemData")));
+    }
+
+    #[test]
+    fn unknown_mode_is_applied_as_auto() {
+        let (mut b, h) = Bridge::new(TxMode::ListenOnly, Instant::now());
+        b.on_bytes(
+            &encode("getCAN 1 0703abcde0501060330000100"),
+            Instant::now(),
+        );
+        let st = h.snapshot();
+        assert_eq!(st.stats.invalid_records, 0);
+        assert_eq!(st.registers.len(), 1);
+    }
+
+    #[test]
+    fn writes_buffered_across_reset_wait_for_steady() {
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        h.queue_write(flush(0x07, 0x12345)).unwrap();
+        b.reset(Instant::now());
+        let script = startup_script();
+        let chunks: Vec<&str> = script.iter().map(String::as_str).collect();
+        let mut link = MockLink::new(&chunks);
+        run(&mut link, &mut b).unwrap();
+        let sent = link.sent();
+        // Startup is unchanged; the write goes out only once Steady.
+        assert_eq!(sent[..5], STARTUP_REPLIES[..5]);
+        assert_eq!(sent[5], "setCAN 0701123450600000000000000");
     }
 
     #[test]

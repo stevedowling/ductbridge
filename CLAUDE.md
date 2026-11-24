@@ -118,7 +118,7 @@ Safety choices already implemented:
 ## Status
 
 - Milestone 1 (done): protocol core and monitor.
-- Milestone 2 (done): `ductbridge` daemon, packaging, CI. 43 tests passing;
+- Milestone 2 (done): `ductbridge` daemon, packaging, CI. 47 tests passing;
   also smoke-tested end to end against a scripted fake CB on a pty.
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -129,11 +129,15 @@ Bridge behaviour worth knowing (beyond the session rules above):
 - Listen-only never calls the session; it learns registers passively from
   `getCAN 1` frames addressed to the tablet. `Handle::queue_write` refuses.
 - Active: only the last Ping in a read is answered, and only if no other
-  frame followed it (slot gone / another tablet). Bad-CRC Pings are ignored.
+  input followed it — a frame, a partial frame or a malformed one; whitespace
+  is allowed (slot gone / another tablet). Bad-CRC Pings are ignored.
 - Our own frames read back within 1 s are counted as echoes; any other
   tablet-side frame (`setCAN`/`ackCAN`/`getSystemData`) is counted as
   foreign and warned about (rate-limited). It does not stop transmitting.
 - Writes are refused until the session is `Steady` and must have dest 01.
+  Channel commands are only drained into the session while it is `Steady`
+  (so writes buffered across a reconnect wait for the new session).
+- Unknown system-status mode codes decode as auto, not as invalid.
 - On serial errors the daemon reopens the port every 5 s and restarts the
   session; the register mirror, liveness and counters are kept.
 
