@@ -251,13 +251,15 @@ impl Session {
         if r.register == 0x06 {
             self.queue_write(firmware_ack(&r));
             let u = (r.unit_type, r.uid);
-            if self.phase == Phase::Flushing
+            if self.phase != Phase::Negotiating
                 && r.is_aircon()
                 && r.uid != 0
                 && !self.flushed_units.contains(&u)
             {
-                // Every announcing unit gets its own flush, so the aircon's
-                // registers arrive even if an RF device announced first.
+                // Every announcing unit gets its own flush (once per
+                // session), so the aircon's registers arrive even if an RF
+                // device announced first, or the aircon announces only after
+                // an earlier unit's flush already took us to Steady.
                 self.queue_write(flush(r.unit_type, r.uid));
                 self.flushed_units.push(u);
                 self.unit_flush_sent = true;
@@ -285,6 +287,16 @@ impl Session {
     }
 
     fn on_ping(&mut self) -> Option<String> {
+        // Every Ping after the global flush counts towards the dump timeout,
+        // whatever this slot is then used for.
+        if self.phase == Phase::Flushing && self.global_flush_sent {
+            self.pings_since_flush += 1;
+            if self.pings_since_flush > FLUSH_TIMEOUT_PINGS {
+                // The dump never completed (e.g. the unit flush was never
+                // confirmed); don't block writes forever.
+                self.set_phase(Phase::Steady);
+            }
+        }
         // 1. Acknowledge a getCAN first.
         if let Some(ok) = self.pending_ack.take() {
             return Some(if ok { "ackCAN 1" } else { "ackCAN 0" }.to_string());
@@ -311,13 +323,8 @@ impl Session {
                     tag: 0,
                 }]));
             }
-            self.pings_since_flush += 1;
             if !self.unit_flush_sent && self.pings_since_flush > UNIT_WAIT_PINGS {
                 // No unit announced itself; carry on with what we have.
-                self.set_phase(Phase::Steady);
-            } else if self.pings_since_flush > FLUSH_TIMEOUT_PINGS {
-                // The unit flush was never confirmed (nacked, dropped or
-                // unanswered); don't block writes forever.
                 self.set_phase(Phase::Steady);
             }
         }
@@ -537,6 +544,44 @@ mod tests {
             }
         }
         assert_eq!(s.phase(), Phase::Steady);
+    }
+
+    #[test]
+    fn dump_timeout_counts_pings_spent_on_acks() {
+        let mut s = Session::new();
+        ping(&mut s);
+        s.on_frame(&frame("CAN2 in use"));
+        ping(&mut s); // global flush
+        s.on_frame(&frame("getCAN 1 0703abcde0602030100000000"));
+        // A getCAN before every Ping: every slot goes to an ackCAN.
+        for _ in 0..=FLUSH_TIMEOUT_PINGS {
+            s.on_frame(&frame("getCAN 0"));
+            assert_eq!(ping(&mut s).as_deref(), Some("ackCAN 1"));
+        }
+        assert_eq!(s.phase(), Phase::Steady);
+    }
+
+    #[test]
+    fn late_announcing_unit_is_flushed_in_steady() {
+        let mut s = Session::new();
+        ping(&mut s);
+        s.on_frame(&frame("CAN2 in use"));
+        ping(&mut s);
+        s.on_frame(&frame("getCAN 1 0803fffff0602030500000000"));
+        ping(&mut s); // ackCAN
+        ping(&mut s).unwrap(); // RF device's fw ack + flush
+        s.on_frame(&frame("getCAN 1 ")); // confirmed -> Steady
+        assert_eq!(s.phase(), Phase::Steady);
+        // The aircon announces only now, in a later reply.
+        s.on_frame(&frame("getCAN 1 0803abcde0602030400000000"));
+        ping(&mut s); // ackCAN
+        let sent = ping(&mut s).unwrap();
+        assert!(sent.contains("0801abcde0600000000000000"), "{sent}");
+        // Re-announcing does not flush again.
+        s.on_frame(&frame("getCAN 1 0803abcde0602030400000000"));
+        ping(&mut s);
+        let sent = ping(&mut s).unwrap();
+        assert!(!sent.contains("0801abcde06"), "{sent}");
     }
 
     #[test]

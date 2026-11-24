@@ -121,7 +121,7 @@ Safety choices already implemented:
 
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
-- Milestone 3 (done): HTTP API. 81 tests passing; smoke-tested end to end
+- Milestone 3 (done): HTTP API. 83 tests passing; smoke-tested end to end
   (fake CB on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -136,10 +136,11 @@ Bridge behaviour worth knowing (beyond the session rules above):
   gone / another tablet). Whitespace and line noise without `<` (e.g. a byte
   from RS-485 driver turnaround) are allowed. Bad-CRC Pings are ignored.
 - Primary unit: the aircon-typed unit that reports register 05 (type 08
-  also covers RF devices, so an announcement is only a first guess). During
-  the dump every announcing aircon-typed unit gets its own unit flush. If
-  the dump never completes (e.g. the unit flush is never confirmed), the
-  session goes Steady after 30 Pings so writes are not blocked.
+  also covers RF devices, so an announcement is only a first guess). Every
+  announcing aircon-typed unit gets its own unit flush, once per session,
+  also if it announces after the session went Steady. If the dump never
+  completes (e.g. the unit flush is never confirmed), the session goes
+  Steady after 30 Pings (every Ping counts, including ack/resend slots).
 - Our own frames read back within 1 s are counted as echoes; any other
   tablet-side frame (`setCAN`/`ackCAN`/`getSystemData`) is counted as
   foreign and warned about (rate-limited). It does not stop transmitting.
