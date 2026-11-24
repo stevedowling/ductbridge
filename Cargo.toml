@@ -1,0 +1,21 @@
+[package]
+name = "ductbridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "Open replacement for a ducted air-conditioning zone controller wall tablet (RS-485)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ductbridge-monitor"
+path = "src/bin/ductbridge-monitor.rs"
+
+[dependencies]
+serialport = { version = "4", default-features = false }
+
+[profile.release]
+lto = true
+strip = true
