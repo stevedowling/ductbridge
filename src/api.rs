@@ -649,6 +649,7 @@ mod tests {
             crate::session::key_of(&w[0]),
             crate::bridge::Pending {
                 record: w[0],
+                seq: 1,
                 accepted: now,
                 confirmed: false,
             },

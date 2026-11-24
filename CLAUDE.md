@@ -121,7 +121,7 @@ Safety choices already implemented:
 
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
-- Milestone 3 (done): HTTP API. 75 tests passing; smoke-tested end to end
+- Milestone 3 (done): HTTP API. 78 tests passing; smoke-tested end to end
   (fake CB on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -176,12 +176,14 @@ PyPI client. Behaviour worth knowing:
   the register (HA's 15 s poll catches up). But `setAircon` builds on
   *pending* desired values (`BusState::pending`, set by `Handle::submit`),
   so back-to-back partial updates don't undo each other. Planning and
-  queueing happen under one lock. A pending value clears only once the CB
-  has confirmed that exact write (`getCAN 1`, session `WriteConfirmed`,
-  which only marks it) *and* a report in that reply or a later one reflects
-  it; on a dropped write only if no other write for that register is queued,
-  in flight, or still in the command channel (`BusState::in_channel`,
-  counted under the state lock by `submit` and the drain); else after 30 s.
+  queueing happen under one lock. Each submission gets a sequence number
+  that travels as the write's tag through the channel and the session
+  (`TaggedWrite`; superseded queued writes just lose their tag). Only events
+  for the pending entry's own sequence number touch it: `WriteConfirmed`
+  marks it (no clearing, since earlier reports may predate it), a later
+  reflecting report clears it in `observe`, and `WriteDropped` clears it.
+  Anything for an older sequence number is ignored. 30 s TTL as a backstop.
+  Carried writes keep their tags across a reset.
 - `json` parameter: parsed raw first (literal `+`), then percent/form-
   decoded. Keys next to `aircons` are rejected.
 - HTTP: one 5 s deadline for the whole request head; 16 KiB cap checked on

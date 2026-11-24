@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crate::frame::{encode, Decoder, DecoderStats, Frame};
 use crate::record::{parse_list, Record, DEST_CB, UNIT_AIRCON_RF};
 use crate::registers::{SystemStatus, ZoneConfig, ZoneInfo, ZoneState};
-use crate::session::{key_of, Event, Phase, RegKey, Session};
+use crate::session::{key_of, Event, Phase, RegKey, Session, TaggedWrite};
 use crate::{log_debug, log_info, log_warn};
 
 /// The original tablet writes at most 63 bytes at a time.
@@ -97,25 +97,32 @@ pub struct BusState {
     pub last_ping: Option<Instant>,
     /// When each unit's registers were first seen.
     pub first_seen: HashMap<Unit, Instant>,
-    /// Accepted writes not yet reflected by the control box: the desired
-    /// value of each register and when it was accepted. New partial updates
-    /// build on these so back-to-back requests do not undo each other.
+    /// The latest accepted submission per register, until the control box
+    /// has confirmed and reflected it. New partial updates build on these so
+    /// back-to-back requests do not undo each other.
     pub pending: HashMap<RegKey, Pending>,
-    /// Accepted writes still in the command channel (not yet drained into
-    /// the session), per register. Updated under this lock by `submit` and
-    /// the drain, so drop handling can see them.
-    pub(crate) in_channel: HashMap<RegKey, u32>,
+    /// Sequence number of the last accepted submission.
+    pub(crate) last_seq: u64,
     pub stats: Stats,
 }
 
-/// An accepted write's desired value. It stays the base for new partial
-/// updates until the box has both confirmed this write (`getCAN 1` for the
-/// `setCAN` carrying it) and reported a register value that reflects it.
+/// The latest accepted submission for a register. Every submission gets a
+/// sequence number that travels with it through the command channel and the
+/// session (as the write's tag), and only events carrying *this* sequence
+/// number change the entry:
+/// - confirmed (`getCAN 1` for the `setCAN` carrying it) marks it;
+/// - a report reflecting the value after that clears it;
+/// - the session dropping it clears it.
+///
+/// Older submissions' events are ignored, so stale reports, superseded
+/// writes and writes still in the channel cannot clear a newer one. Entries
+/// older than [`PENDING_TTL`] are ignored as a last resort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pending {
     pub record: Record,
+    pub seq: u64,
     pub accepted: Instant,
-    /// The box accepted a `setCAN` carrying exactly this value.
+    /// The box accepted the `setCAN` carrying this submission.
     pub confirmed: bool,
 }
 
@@ -151,7 +158,7 @@ impl BusState {
             last_ping: None,
             first_seen: HashMap::new(),
             pending: HashMap::new(),
-            in_channel: HashMap::new(),
+            last_seq: 0,
             stats: Stats::default(),
         }
     }
@@ -195,16 +202,6 @@ impl BusState {
         }
         self.registers.insert(key, r);
         true
-    }
-}
-
-fn take_from_channel(st: &mut BusState, r: &Record) {
-    let key = key_of(r);
-    if let Some(n) = st.in_channel.get_mut(&key) {
-        *n -= 1;
-        if *n == 0 {
-            st.in_channel.remove(&key);
-        }
     }
 }
 
@@ -262,7 +259,7 @@ pub enum WriteError {
 #[derive(Clone)]
 pub struct Handle {
     state: Arc<Mutex<BusState>>,
-    tx: Sender<Record>,
+    tx: Sender<TaggedWrite>,
 }
 
 fn lock(m: &Mutex<BusState>) -> MutexGuard<'_, BusState> {
@@ -304,15 +301,17 @@ impl Handle {
         if writes.iter().any(|r| r.dest != DEST_CB) {
             return err(WriteError::NotToControlBox);
         }
-        for r in writes {
+        for record in writes {
+            st.last_seq += 1;
+            let seq = st.last_seq;
             self.tx
-                .send(r)
+                .send(TaggedWrite { record, tag: seq })
                 .map_err(|_| SubmitError::Write(WriteError::Disconnected))?;
-            *st.in_channel.entry(key_of(&r)).or_default() += 1;
             st.pending.insert(
-                key_of(&r),
+                key_of(&record),
                 Pending {
-                    record: r,
+                    record,
+                    seq,
                     accepted: now,
                     confirmed: false,
                 },
@@ -346,9 +345,9 @@ pub struct Bridge {
     carry: DecoderStats,
     session: Session,
     /// Writes taken from a replaced session, re-queued once the new one is Steady.
-    carried_writes: Vec<Record>,
+    carried_writes: Vec<TaggedWrite>,
     state: Arc<Mutex<BusState>>,
-    commands: Receiver<Record>,
+    commands: Receiver<TaggedWrite>,
     last_tx: Option<(String, Instant)>,
     started: Instant,
     silent_warned: bool,
@@ -404,11 +403,11 @@ impl Bridge {
         self.decoder = Decoder::new();
         // Keep unconfirmed client writes. Firmware acks (07) and flushes (06)
         // belong to the old session's startup; the new session makes its own.
-        let pending: Vec<Record> = self
+        let pending: Vec<TaggedWrite> = self
             .session
             .take_pending_writes()
             .into_iter()
-            .filter(|r| !matches!(r.register, 0x06 | 0x07))
+            .filter(|w| !matches!(w.record.register, 0x06 | 0x07))
             .collect();
         if !pending.is_empty() {
             log_info!(
@@ -500,8 +499,8 @@ impl Bridge {
             if self.session.phase() == Phase::Steady {
                 // Older carried writes first, so newer commands to the same
                 // register replace them (latest value wins).
-                for r in self.carried_writes.drain(..) {
-                    self.session.queue_write(r);
+                for w in self.carried_writes.drain(..) {
+                    self.session.queue_tagged(w.record, w.tag);
                 }
                 self.drain_commands();
             }
@@ -561,15 +560,13 @@ impl Bridge {
     }
 
     fn drain_commands(&mut self) {
-        // Under the state lock, so `submit` cannot interleave between a
-        // write leaving the channel and its count being updated.
-        let mut st = lock(&self.state);
-        while let Ok(r) = self.commands.try_recv() {
-            log_info!("write queued: {}", crate::describe(&r));
-            take_from_channel(&mut st, &r);
-            self.session.queue_write(r);
-            st.stats.writes_queued += 1;
+        let mut n = 0;
+        while let Ok(w) = self.commands.try_recv() {
+            log_info!("write queued: {}", crate::describe(&w.record));
+            self.session.queue_tagged(w.record, w.tag);
+            n += 1;
         }
+        self.state().stats.writes_queued += n;
     }
 
     fn process_events(&mut self, now: Instant) {
@@ -586,16 +583,15 @@ impl Bridge {
                 }
                 Event::WriteDropped(v) => {
                     st.stats.writes_dropped += v.len() as u64;
-                    for r in &v {
-                        // Keep it while a write to the register is still
-                        // queued, in flight, or waiting in the command
-                        // channel (a newer, possibly identical, submission).
-                        let key = key_of(r);
-                        if !self.session.has_write_for(&key) && !st.in_channel.contains_key(&key) {
+                    for w in &v {
+                        // Only if it is still the latest submission; a newer
+                        // one (queued, in flight or in the channel) stays.
+                        let key = key_of(&w.record);
+                        if st.pending.get(&key).is_some_and(|p| p.seq == w.tag) {
                             st.pending.remove(&key);
                         }
                     }
-                    let list: Vec<String> = v.iter().map(|r| r.to_string()).collect();
+                    let list: Vec<String> = v.iter().map(|w| w.record.to_string()).collect();
                     log_warn!(
                         "control box never confirmed write; dropped: {}",
                         list.join(" ")
@@ -606,9 +602,9 @@ impl Bridge {
                     // reply's register reports, and those (or later ones)
                     // clear it in `observe` once they reflect the value. An
                     // earlier report may predate the write.
-                    for r in &v {
-                        if let Some(p) = st.pending.get_mut(&key_of(r)) {
-                            if p.record == *r {
+                    for w in &v {
+                        if let Some(p) = st.pending.get_mut(&key_of(&w.record)) {
+                            if p.seq == w.tag {
                                 p.confirmed = true;
                             }
                         }
@@ -664,10 +660,7 @@ impl Bridge {
         drop(st);
         if self.mode == TxMode::ListenOnly {
             // Handle refuses writes in this mode; discard any that raced in.
-            let mut st = lock(&self.state);
-            while let Ok(r) = self.commands.try_recv() {
-                take_from_channel(&mut st, &r);
-            }
+            while self.commands.try_recv().is_ok() {}
         }
     }
 }
@@ -1134,9 +1127,54 @@ mod tests {
         let st = h.snapshot();
         assert_eq!(st.stats.writes_dropped, 1);
         assert_eq!(st.desired(&KEY, t), Some(&rec(OFF)), "channel write kept");
-        // It is drained and sent on the next Ping, and the count clears.
+        // It is drained and sent on the next Ping, still the pending value.
         assert_eq!(b.on_bytes(&encode("Ping"), t), Some(first));
-        assert!(h.snapshot().in_channel.is_empty());
+        assert_eq!(h.snapshot().pending[&KEY].seq, 2);
+    }
+
+    #[test]
+    fn identical_value_confirmation_for_an_older_submission_does_not_mark_newer() {
+        // off sent (seq 1); identical off resubmitted (seq 2) and queued.
+        // Confirming seq 1 must not mark seq 2 confirmed, so a reflecting
+        // report then leaves seq 2 pending until its own confirmation.
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        let t = Instant::now();
+        h.queue_write(rec(OFF)).unwrap();
+        assert_eq!(
+            b.on_bytes(&encode("Ping"), t),
+            Some(encode(&format!("setCAN {OFF}")))
+        );
+        h.queue_write(rec(OFF)).unwrap();
+        b.on_bytes(&report("00010330000100"), t); // confirms seq 1, reflects
+        let st = h.snapshot();
+        assert_eq!(st.pending[&KEY].seq, 2);
+        assert!(!st.pending[&KEY].confirmed);
+        // seq 2 goes out, is confirmed and reflected: cleared.
+        assert_eq!(b.on_bytes(&encode("Ping"), t), Some(encode("ackCAN 1")));
+        assert_eq!(
+            b.on_bytes(&encode("Ping"), t),
+            Some(encode(&format!("setCAN {OFF}")))
+        );
+        b.on_bytes(&report("00010330000100"), t);
+        assert!(h.snapshot().pending.is_empty());
+    }
+
+    #[test]
+    fn carried_writes_keep_their_sequence_numbers() {
+        let (_l, mut b, h) = run_script(TxMode::Active, &startup_script(), false);
+        let t = Instant::now();
+        h.queue_write(rec(OFF)).unwrap();
+        b.on_bytes(&encode("Ping"), t); // in flight, unconfirmed
+        b.reset(t);
+        let script = startup_script();
+        let chunks: Vec<&str> = script.iter().map(String::as_str).collect();
+        let mut link = MockLink::new(&chunks);
+        run(&mut link, &mut b).unwrap();
+        assert_eq!(link.sent()[5], format!("setCAN {OFF}"));
+        // Confirmed with a reflecting report after the reset: cleared,
+        // because the carried write kept seq 1.
+        b.on_bytes(&report("00010330000100"), t);
+        assert!(h.snapshot().pending.is_empty());
     }
 
     #[test]
