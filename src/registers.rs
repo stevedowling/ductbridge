@@ -105,9 +105,7 @@ impl SystemStatus {
         if p[0] > 1 {
             return Err(RegError::OutOfRange("system on"));
         }
-        if p[1] > 5 {
-            return Err(RegError::OutOfRange("mode"));
-        }
+        // Unknown mode codes are not an error: they decode as auto.
         let fan = Fan::from_wire(p[2]).ok_or(RegError::OutOfRange("fan"))?;
         if p[3] > 80 {
             return Err(RegError::OutOfRange("set temperature"));
@@ -338,6 +336,8 @@ mod tests {
         assert!(SystemStatus::decode(&rec("0703abcde0502010330000100")).is_err()); // on=2
         assert!(SystemStatus::decode(&rec("0703abcde0501010351000100")).is_err()); // 0x51 = 40.5 °C
         assert!(SystemStatus::decode(&rec("0703abcde0501010330000111")).is_err());
+        let s = SystemStatus::decode(&rec("0703abcde0501060330000100")).unwrap(); // mode 6
+        assert_eq!(s.mode, Mode::Auto);
         // rf id 17
     }
 

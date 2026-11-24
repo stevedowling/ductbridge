@@ -11,8 +11,7 @@ control box, so the system keeps working when the tablet fails.
 
 ## Status
 
-**Milestone 1: protocol core + listen-only monitor.** Not yet tested against a
-real control box.
+**Milestone 2: bus daemon.** Not yet tested against a real control box.
 
 | Piece | State |
 |---|---|
@@ -22,7 +21,7 @@ real control box.
 | Typed registers 01, 03, 05, 06, 07, 08, 0a | Done, with range checks |
 | Session state machine | Done (pure logic, no I/O): negotiate, two-phase flush, `ackCAN 1`/`0`, resend until `getCAN 1` (max 3), max 25 records per `setCAN`, firmware ack, quiet while `CAN2 in use` |
 | `ductbridge-monitor` | Done. Listen-only; never transmits |
-| Daemon that drives the bus | Milestone 2 |
+| `ductbridge` bus daemon | Done. Listen-only by default; `--active` replaces the tablet. Reconnects to the serial port, tracks units online/offline, logs every frame at debug level. See [packaging/INSTALL.md](packaging/INSTALL.md) |
 | Local HTTP API on port 2025 (compatible with existing apps and Home Assistant) | Milestone 3 |
 
 ## Safety
@@ -52,11 +51,14 @@ Serial settings: 57600 baud, 8N1, half-duplex.
 cargo test
 cargo run --bin ductbridge-monitor -- /dev/ttyUSB0   # live bus, listen-only
 cargo run --bin ductbridge-monitor -- capture.bin    # replay a raw capture
+cargo run --bin ductbridge -- --help                 # bus daemon
 ```
+
+Installing on a Pi as a systemd service: [packaging/INSTALL.md](packaging/INSTALL.md).
 
 CI runs `cargo fmt`, `clippy` and tests, then cross-compiles for 64-bit
 Raspberry Pi OS (`aarch64-unknown-linux-gnu`). Push a `v*` tag to attach the
-binary to a GitHub release.
+binaries to a GitHub release.
 
 ## Acknowledgements
 

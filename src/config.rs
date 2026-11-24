@@ -1,0 +1,263 @@
+//! Daemon configuration: defaults, then the config file, then the command line.
+//!
+//! The file is plain `key = value` lines (a subset of TOML); `#` starts a
+//! comment and values may be quoted:
+//!
+//! ```text
+//! port = "/dev/ttyUSB0"
+//! http_bind = "0.0.0.0:2025"
+//! mode = "listen-only"     # or "active"
+//! log_level = "info"       # error, warn, info, debug
+//! ```
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::bridge::TxMode;
+use crate::log::Level;
+
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/ductbridge.conf";
+
+pub const USAGE: &str = "\
+Usage: ductbridge [OPTIONS]
+
+Drives the RS-485 bus in place of the wall tablet.
+
+Options:
+  -c, --config PATH      config file (default /etc/ductbridge.conf, if present)
+  -p, --port DEVICE      serial device (default /dev/ttyUSB0)
+      --http-bind ADDR   HTTP API address (default 0.0.0.0:2025; milestone 3)
+      --listen-only      never transmit (default)
+      --active           answer the control box's Pings (replaces the tablet)
+      --log-level LEVEL  error, warn, info or debug (default info)
+  -h, --help             show this help
+  -V, --version          show the version
+";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub port: String,
+    pub http_bind: String,
+    pub mode: TxMode,
+    pub log_level: Level,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            port: "/dev/ttyUSB0".into(),
+            http_bind: "0.0.0.0:2025".into(),
+            mode: TxMode::ListenOnly,
+            log_level: Level::Info,
+        }
+    }
+}
+
+/// What the command line asked for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    Run(Config),
+    Help,
+    Version,
+}
+
+fn parse_mode(s: &str) -> Result<TxMode, String> {
+    match s {
+        "listen-only" | "listen_only" => Ok(TxMode::ListenOnly),
+        "active" => Ok(TxMode::Active),
+        _ => Err(format!("unknown mode {s:?} (listen-only or active)")),
+    }
+}
+
+fn unquote(v: &str) -> &str {
+    let v = v.trim();
+    for q in ['"', '\''] {
+        if let Some(inner) = v.strip_prefix(q).and_then(|v| v.strip_suffix(q)) {
+            return inner;
+        }
+    }
+    v
+}
+
+/// Apply a config file's settings on top of `cfg`.
+pub fn apply_file(cfg: &mut Config, text: &str) -> Result<(), String> {
+    for (n, raw) in text.lines().enumerate() {
+        let line_no = n + 1;
+        // Strip comments outside quotes.
+        let mut in_quote = None;
+        let mut end = raw.len();
+        for (i, c) in raw.char_indices() {
+            match (c, in_quote) {
+                ('"' | '\'', None) => in_quote = Some(c),
+                (c, Some(q)) if c == q => in_quote = None,
+                ('#', None) => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let line = raw[..end].trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (k, v) = line
+            .split_once('=')
+            .ok_or_else(|| format!("line {line_no}: expected key = value"))?;
+        let v = unquote(v);
+        let err = |e: String| format!("line {line_no}: {e}");
+        match k.trim() {
+            "port" => cfg.port = v.to_string(),
+            "http_bind" => cfg.http_bind = v.to_string(),
+            "mode" => cfg.mode = parse_mode(v).map_err(err)?,
+            "log_level" => cfg.log_level = v.parse().map_err(err)?,
+            other => return Err(format!("line {line_no}: unknown key {other:?}")),
+        }
+    }
+    Ok(())
+}
+
+/// Build the configuration from command-line arguments (without the program
+/// name). `read` loads a config file; it is a parameter so tests need no files.
+pub fn from_args<I, F>(args: I, read: F) -> Result<Action, String>
+where
+    I: IntoIterator<Item = String>,
+    F: Fn(&Path) -> io::Result<String>,
+{
+    let mut config_path: Option<PathBuf> = None;
+    let mut overrides: Vec<(String, String)> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (a.clone(), None),
+        };
+        let mut value = |name: &str| {
+            inline
+                .clone()
+                .or_else(|| it.next())
+                .ok_or_else(|| format!("{name} needs a value"))
+        };
+        match flag.as_str() {
+            "-h" | "--help" | "-V" | "--version" | "--listen-only" | "--active"
+                if inline.is_some() =>
+            {
+                return Err(format!("{flag} takes no value"))
+            }
+            "-h" | "--help" => return Ok(Action::Help),
+            "-V" | "--version" => return Ok(Action::Version),
+            "-c" | "--config" => config_path = Some(value(&flag)?.into()),
+            "-p" | "--port" => overrides.push(("port".into(), value(&flag)?)),
+            "--http-bind" => overrides.push(("http_bind".into(), value(&flag)?)),
+            "--log-level" => overrides.push(("log_level".into(), value(&flag)?)),
+            "--listen-only" => overrides.push(("mode".into(), "listen-only".into())),
+            "--active" => overrides.push(("mode".into(), "active".into())),
+            _ => return Err(format!("unknown argument {a:?}\n\n{USAGE}")),
+        }
+    }
+
+    let mut cfg = Config::default();
+    match &config_path {
+        Some(p) => {
+            let text = read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            apply_file(&mut cfg, &text).map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+        None => match read(Path::new(DEFAULT_CONFIG_PATH)) {
+            Ok(text) => {
+                apply_file(&mut cfg, &text).map_err(|e| format!("{DEFAULT_CONFIG_PATH}: {e}"))?
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{DEFAULT_CONFIG_PATH}: {e}")),
+        },
+    }
+    for (k, v) in overrides {
+        // Reuse the file parser so both paths validate identically.
+        apply_file(&mut cfg, &format!("{k} = \"{v}\"")).map_err(|e| {
+            format!(
+                "--{}: {}",
+                k.replace('_', "-"),
+                e.trim_start_matches("line 1: ")
+            )
+        })?;
+    }
+    Ok(Action::Run(cfg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+    fn no_file(_: &Path) -> io::Result<String> {
+        Err(io::ErrorKind::NotFound.into())
+    }
+    fn run(a: &str, read: impl Fn(&Path) -> io::Result<String>) -> Result<Config, String> {
+        match from_args(args(a), read)? {
+            Action::Run(c) => Ok(c),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn defaults_to_listen_only() {
+        let c = run("", no_file).unwrap();
+        assert_eq!(c, Config::default());
+        assert_eq!(c.mode, TxMode::ListenOnly);
+        assert_eq!(c.port, "/dev/ttyUSB0");
+    }
+
+    #[test]
+    fn file_then_cli_override() {
+        let file = |p: &Path| {
+            assert_eq!(p, Path::new("/x.conf"));
+            Ok(
+                "# comment\nport = \"/dev/serial/by-id/usb-x#1\"  # trailing\n\
+                mode = active\nlog_level='debug'\n\nhttp_bind = 127.0.0.1:2025\n"
+                    .to_string(),
+            )
+        };
+        let c = run("-c /x.conf", file).unwrap();
+        assert_eq!(c.port, "/dev/serial/by-id/usb-x#1");
+        assert_eq!(c.mode, TxMode::Active);
+        assert_eq!(c.log_level, Level::Debug);
+        assert_eq!(c.http_bind, "127.0.0.1:2025");
+
+        let c = run("--config=/x.conf --listen-only --port /dev/ttyUSB1", file).unwrap();
+        assert_eq!(c.mode, TxMode::ListenOnly);
+        assert_eq!(c.port, "/dev/ttyUSB1");
+    }
+
+    #[test]
+    fn default_file_is_used_when_present() {
+        let c = run("", |_: &Path| Ok("mode = \"active\"".into())).unwrap();
+        assert_eq!(c.mode, TxMode::Active);
+    }
+
+    #[test]
+    fn errors() {
+        assert!(run("-c /missing", no_file)
+            .unwrap_err()
+            .contains("/missing"));
+        assert!(run("--bogus", no_file).is_err());
+        assert!(run("--port", no_file)
+            .unwrap_err()
+            .contains("needs a value"));
+        assert!(run("--log-level loud", no_file).is_err());
+        assert!(run("--active=false", no_file)
+            .unwrap_err()
+            .contains("takes no value"));
+        assert!(run("--listen-only=1", no_file).is_err());
+        let bad = |_: &Path| Ok("mode = transmit".to_string());
+        assert!(run("", bad).unwrap_err().contains("line 1"));
+        let bad = |_: &Path| Ok("colour = blue".to_string());
+        assert!(run("", bad).unwrap_err().contains("unknown key"));
+    }
+
+    #[test]
+    fn help_and_version() {
+        assert_eq!(from_args(args("--help"), no_file), Ok(Action::Help));
+        assert_eq!(from_args(args("-V"), no_file), Ok(Action::Version));
+    }
+}

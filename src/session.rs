@@ -127,6 +127,15 @@ impl Session {
         self.queue.push_back(r);
     }
 
+    /// Remove and return every write not yet confirmed by the box: the
+    /// in-flight `setCAN` first, then the queue. Used when the session is
+    /// replaced, so the caller can carry them over.
+    pub fn take_pending_writes(&mut self) -> Vec<Record> {
+        let mut out: Vec<Record> = self.in_flight.take().map(|f| f.records).unwrap_or_default();
+        out.extend(self.queue.drain(..));
+        out
+    }
+
     pub fn drain_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
@@ -409,6 +418,18 @@ mod tests {
         }
         let sent = ping(&mut s).unwrap();
         assert_eq!(sent.split(' ').count() - 1, MAX_RECORDS);
+    }
+
+    #[test]
+    fn take_pending_writes_returns_in_flight_then_queue() {
+        let mut s = synced();
+        s.queue_write(crate::registers::flush(0x07, 1));
+        ping(&mut s).unwrap(); // in flight
+        s.queue_write(crate::registers::flush(0x07, 2));
+        let uids: Vec<u32> = s.take_pending_writes().iter().map(|r| r.uid).collect();
+        assert_eq!(uids, [1, 2]);
+        assert!(s.take_pending_writes().is_empty());
+        assert_eq!(ping(&mut s).as_deref(), Some("setCAN "));
     }
 
     #[test]

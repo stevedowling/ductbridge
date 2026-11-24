@@ -10,6 +10,10 @@ description = "Open replacement for a ducted air-conditioning zone controller wa
 path = "src/lib.rs"
 
 [[bin]]
+name = "ductbridge"
+path = "src/bin/ductbridge.rs"
+
+[[bin]]
 name = "ductbridge-monitor"
 path = "src/bin/ductbridge-monitor.rs"
 

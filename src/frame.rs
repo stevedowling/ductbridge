@@ -22,10 +22,28 @@ pub struct Frame {
     pub crc_ok: bool,
 }
 
+/// Counts of input the decoder had to throw away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecoderStats {
+    /// Bytes outside any frame (line noise, separators, buffer overflow).
+    pub noise_bytes: u64,
+    /// Frames cut short by a new start tag before their end tag.
+    pub truncated: u64,
+    /// Frames whose `xx>` trailer was not two hex digits and `>`.
+    pub malformed: u64,
+}
+
 /// Streaming decoder: push raw bytes in, pull complete frames out.
 #[derive(Default)]
 pub struct Decoder {
     buf: Vec<u8>,
+    stats: DecoderStats,
+    /// Non-whitespace bytes received after the end of the last returned frame.
+    trailing: usize,
+}
+
+fn non_ws(b: &[u8]) -> usize {
+    b.iter().filter(|c| !c.is_ascii_whitespace()).count()
 }
 
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -52,12 +70,26 @@ impl Decoder {
         Self::default()
     }
 
+    /// Running totals of discarded input.
+    pub fn stats(&self) -> DecoderStats {
+        self.stats
+    }
+
     /// Add bytes read from the serial port.
+    /// Was anything other than whitespace received after the last frame
+    /// returned by [`next_frame`](Self::next_frame)? Covers partial frames
+    /// still buffered and malformed or noise bytes already discarded.
+    pub fn has_trailing_input(&self) -> bool {
+        self.trailing > 0
+    }
+
     pub fn push(&mut self, bytes: &[u8]) {
+        self.trailing += non_ws(bytes);
         self.buf.extend_from_slice(bytes);
         if self.buf.len() > MAX_BUFFER {
             let cut = self.buf.len() - MAX_BUFFER;
             self.buf.drain(..cut);
+            self.stats.noise_bytes += cut as u64;
         }
     }
 
@@ -71,11 +103,13 @@ impl Decoder {
                     let keep = self.buf.len().min(START.len() - 1);
                     let cut = self.buf.len() - keep;
                     self.buf.drain(..cut);
+                    self.stats.noise_bytes += cut as u64;
                     return None;
                 }
             };
             if start > 0 {
                 self.buf.drain(..start);
+                self.stats.noise_bytes += start as u64;
             }
             let body = START.len();
             let end = find(&self.buf, END, body)?;
@@ -84,6 +118,7 @@ impl Decoder {
             if let Some(next) = find(&self.buf, START, body) {
                 if next < end {
                     self.buf.drain(..next);
+                    self.stats.truncated += 1;
                     continue;
                 }
             }
@@ -97,7 +132,11 @@ impl Decoder {
             };
             let payload_bytes = self.buf[body..end].to_vec();
             self.buf.drain(..tail + 3);
-            let Some(crc) = crc else { continue };
+            let Some(crc) = crc else {
+                self.stats.malformed += 1;
+                continue;
+            };
+            self.trailing = non_ws(&self.buf);
             return Some(Frame {
                 crc_ok: crc8(&payload_bytes) == crc,
                 payload: String::from_utf8_lossy(&payload_bytes).into_owned(),
@@ -173,5 +212,31 @@ mod tests {
         d.push(b"<U>getCAN 1 0703<U>Ping</U=db>");
         assert_eq!(d.next_frame().unwrap().payload, "Ping");
         assert_eq!(d.next_frame(), None);
+        assert_eq!(d.stats().truncated, 1);
+    }
+
+    #[test]
+    fn reports_input_after_the_last_frame() {
+        let mut d = Decoder::new();
+        d.push(b"<U>Ping</U=db> \r\n");
+        d.next_frame().unwrap();
+        assert!(!d.has_trailing_input()); // whitespace only
+        d.push(b"<U>setCAN ");
+        assert_eq!(d.next_frame(), None);
+        assert!(d.has_trailing_input()); // partial frame
+        let mut d = Decoder::new();
+        d.push(b"<U>Ping</U=db><U>x</U=zz>");
+        d.next_frame().unwrap();
+        assert_eq!(d.next_frame(), None);
+        assert!(d.has_trailing_input()); // malformed frame, already discarded
+    }
+
+    #[test]
+    fn counts_noise_and_malformed_trailers() {
+        let mut d = Decoder::new();
+        d.push(b"xyz<U>Ping</U=zz><U>Ping</U=db>");
+        assert_eq!(d.next_frame().unwrap().payload, "Ping");
+        let st = d.stats();
+        assert_eq!((st.noise_bytes, st.malformed), (3, 1));
     }
 }
