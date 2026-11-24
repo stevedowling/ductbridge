@@ -6,9 +6,14 @@
 //! - [`record`]: 25-character CAN2 register records
 //! - [`registers`]: typed register fields
 //! - [`session`]: the tablet's side of the bus conversation
+//! - [`bridge`]: session + link + shared state for the API layer
+//! - [`config`], [`log`]: daemon plumbing
 
+pub mod bridge;
+pub mod config;
 pub mod crc;
 pub mod frame;
+pub mod log;
 pub mod record;
 pub mod registers;
 pub mod session;

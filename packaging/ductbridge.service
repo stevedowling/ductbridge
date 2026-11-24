@@ -1,0 +1,30 @@
+[Unit]
+Description=ductbridge RS-485 zone controller bridge
+Documentation=https://github.com/stevedowling/ductbridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ductbridge --config /etc/ductbridge.conf
+Restart=always
+RestartSec=5
+User=ductbridge
+Group=ductbridge
+SupplementaryGroups=dialout
+
+# Hardening. The daemon only needs the serial port and (from milestone 3)
+# a TCP listener.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -37,8 +37,14 @@ src/frame.rs      <U>payload</U=xx> encoder + streaming decoder
 src/record.rs     25-hex-char CAN2 register records
 src/registers.rs  typed registers 01, 03, 05, 06, 07, 08, 0a + write builders
 src/session.rs    tablet-side session state machine (pure)
+src/bridge.rs     Bridge (session + decoder + shared BusState, pure on_bytes/tick),
+                  Handle for the API layer, run() I/O loop, MockLink tests
+src/config.rs     defaults < config file < CLI (pure; file reader injected)
+src/log.rs        levelled stderr logging; journald priorities under systemd
 src/lib.rs        module wiring + describe() for logs
+src/bin/ductbridge.rs           bus daemon (opens port, reconnects, runs bridge)
 src/bin/ductbridge-monitor.rs   listen-only bus monitor (never transmits)
+packaging/        systemd unit, example config, INSTALL.md
 .github/workflows/ci.yml        fmt, clippy, test, aarch64 cross-build, release on v* tag
 ```
 
@@ -111,32 +117,27 @@ Safety choices already implemented:
 
 ## Status
 
-- Milestone 1 (done): everything in Layout above; 26 tests passing.
+- Milestone 1 (done): protocol core and monitor.
+- Milestone 2 (done): `ductbridge` daemon, packaging, CI. 43 tests passing;
+  also smoke-tested end to end against a scripted fake CB on a pty.
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
   vs also answering legacy XML). Code must work with register-only.
 
-## Next: milestone 2 — bus daemon
+Bridge behaviour worth knowing (beyond the session rules above):
 
-Binary `ductbridge`:
+- Listen-only never calls the session; it learns registers passively from
+  `getCAN 1` frames addressed to the tablet. `Handle::queue_write` refuses.
+- Active: only the last Ping in a read is answered, and only if no other
+  frame followed it (slot gone / another tablet). Bad-CRC Pings are ignored.
+- Our own frames read back within 1 s are counted as echoes; any other
+  tablet-side frame (`setCAN`/`ackCAN`/`getSystemData`) is counted as
+  foreign and warned about (rate-limited). It does not stop transmitting.
+- Writes are refused until the session is `Steady` and must have dest 01.
+- On serial errors the daemon reopens the port every 5 s and restarts the
+  session; the register mirror, liveness and counters are kept.
 
-- Open serial port (configurable, default `/dev/ttyUSB0`, 57600 8N1).
-- Read loop → `frame::Decoder` → `Session::on_frame`; when it returns a
-  payload after a Ping, write `frame::encode(payload)` promptly (well inside
-  the ~1 s slot; aim for <100 ms), in ≤63-byte chunks.
-- Expect to read back our own transmitted frames on half-duplex adapters;
-  the session already ignores echoes, but test it.
-- Shared state for the API layer: register mirror + unit online/offline
-  (80 s / 260 s windows) + a command channel that calls `queue_write`.
-- Modes: `--listen-only` (never transmit) and normal. Default to listen-only
-  until explicitly configured otherwise.
-- Config via file + CLI (port, HTTP bind address, mode, log level).
-- Structured logging of every frame at debug level; drop/garble counters.
-- systemd unit file and install notes in `packaging/`.
-- Tests: drive the I/O loop with an in-memory mock link replaying captures.
-- Add the binary to the CI build and release.
-
-## Then: milestone 3 — port-2025 HTTP API
+## Next: milestone 3 — port-2025 HTTP API
 
 Reproduce the tablet's local API so existing clients work unchanged:
 `GET /getSystemData`, `GET /setAircon?json={…}`, plus zone/MyZone settings
