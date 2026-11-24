@@ -35,7 +35,7 @@ CH340) at `/dev/ttyUSB0`, run as a systemd service. Binaries are built by CI
 src/crc.rs        CRC-8 for frames
 src/frame.rs      <U>payload</U=xx> encoder + streaming decoder
 src/record.rs     25-hex-char CAN2 register records
-src/registers.rs  typed registers 01, 03, 05, 06, 07, 08, 0a + write builders
+src/registers.rs  typed registers 01, 03, 04, 05, 06, 07, 08, 0a + write builders
 src/session.rs    tablet-side session state machine (pure)
 src/bridge.rs     Bridge (session + decoder + shared BusState, pure on_bytes/tick),
                   Handle for the API layer, run() I/O loop, MockLink tests
