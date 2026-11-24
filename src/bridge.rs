@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use crate::frame::{encode, Decoder, DecoderStats, Frame};
 use crate::record::{parse_list, Record, DEST_CB, UNIT_AIRCON_RF};
-use crate::registers::{SystemStatus, ZoneInfo, ZoneState};
+use crate::registers::{SystemStatus, ZoneConfig, ZoneInfo, ZoneState};
 use crate::session::{key_of, Event, Phase, RegKey, Session};
 use crate::{log_debug, log_info, log_warn};
 
@@ -144,6 +144,7 @@ fn validate(r: &Record) -> Result<(), String> {
         SystemStatus::REG => SystemStatus::decode(r).map(drop),
         ZoneState::REG => ZoneState::decode(r).map(drop),
         ZoneInfo::REG => ZoneInfo::decode(r).map(drop),
+        ZoneConfig::REG => ZoneConfig::decode(r).map(drop),
         _ => Ok(()),
     };
     res.map_err(|e| format!("{e:?}"))

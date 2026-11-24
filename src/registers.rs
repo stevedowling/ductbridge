@@ -230,6 +230,46 @@ impl ZoneState {
     }
 }
 
+/// Register 04: per-zone configuration (JZ13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneConfig {
+    pub zone: u8,
+    pub min_damper: u8,
+    pub max_damper: u8,
+    pub motion: u8,
+    pub motion_config: u8,
+    /// Bit flags: 0 sensor clash, 1 low battery, 2 motion/other clash.
+    pub error: u8,
+    pub rssi: u8,
+}
+
+impl ZoneConfig {
+    pub const REG: u8 = 0x04;
+
+    pub fn decode(r: &Record) -> Result<Self, RegError> {
+        check(r, Self::REG)?;
+        let p = r.payload;
+        if !(1..=MAX_ZONES).contains(&p[0]) {
+            return Err(RegError::OutOfRange("zone number"));
+        }
+        if p[3] > 22 {
+            return Err(RegError::OutOfRange("motion status"));
+        }
+        if p[4] > 2 {
+            return Err(RegError::OutOfRange("motion config"));
+        }
+        Ok(ZoneConfig {
+            zone: p[0],
+            min_damper: p[1],
+            max_damper: p[2],
+            motion: p[3],
+            motion_config: p[4],
+            error: p[5],
+            rssi: p[6],
+        })
+    }
+}
+
 /// Register 01: zone configuration (JZ7 read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZoneInfo {
@@ -396,6 +436,27 @@ mod tests {
             w.encode_write(UNIT_AIRCON, 0xabcde).unwrap().to_string(),
             "0701abcde0301e40030000000"
         );
+    }
+
+    #[test]
+    fn zone_config() {
+        let z = ZoneConfig::decode(&rec("0703abcde0402056402010050")).unwrap();
+        assert_eq!(
+            (
+                z.zone,
+                z.min_damper,
+                z.max_damper,
+                z.motion,
+                z.motion_config,
+                z.error,
+                z.rssi
+            ),
+            (2, 5, 100, 2, 1, 0, 0x50)
+        );
+        assert!(ZoneConfig::decode(&rec("0703abcde040b056402010050")).is_err()); // zone 11
+        assert!(ZoneConfig::decode(&rec("0703abcde0402056417010050")).is_err()); // motion 23
+        assert!(ZoneConfig::decode(&rec("0703abcde0402056402030050")).is_err());
+        // config 3
     }
 
     #[test]

@@ -5,14 +5,19 @@
 //!
 //! ```text
 //! port = "/dev/ttyUSB0"
-//! http_bind = "0.0.0.0:2025"
+//! http_bind = "0.0.0.0:2025"  # or "off"
 //! mode = "listen-only"     # or "active"
 //! log_level = "info"       # error, warn, info, debug
+//! system_name = "Home"     # names shown by apps (not stored on the bus)
+//! system_id = "ductbridge" # stable id; Home Assistant's unique id
+//! aircon_name = "Aircon"
+//! zone_names = "Living, Kitchen, Bed 1"   # zone 1 first, comma-separated
 //! ```
 
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::api::ApiInfo;
 use crate::bridge::TxMode;
 use crate::log::Level;
 
@@ -26,7 +31,7 @@ Drives the RS-485 bus in place of the wall tablet.
 Options:
   -c, --config PATH      config file (default /etc/ductbridge.conf, if present)
   -p, --port DEVICE      serial device (default /dev/ttyUSB0)
-      --http-bind ADDR   HTTP API address (default 0.0.0.0:2025; milestone 3)
+      --http-bind ADDR   HTTP API address (default 0.0.0.0:2025; \"off\" disables)
       --listen-only      never transmit (default)
       --active           answer the control box's Pings (replaces the tablet)
       --log-level LEVEL  error, warn, info or debug (default info)
@@ -40,6 +45,8 @@ pub struct Config {
     pub http_bind: String,
     pub mode: TxMode,
     pub log_level: Level,
+    /// Names and id reported by the HTTP API.
+    pub api: ApiInfo,
 }
 
 impl Default for Config {
@@ -49,6 +56,7 @@ impl Default for Config {
             http_bind: "0.0.0.0:2025".into(),
             mode: TxMode::ListenOnly,
             log_level: Level::Info,
+            api: ApiInfo::default(),
         }
     }
 }
@@ -109,6 +117,17 @@ pub fn apply_file(cfg: &mut Config, text: &str) -> Result<(), String> {
         match k.trim() {
             "port" => cfg.port = v.to_string(),
             "http_bind" => cfg.http_bind = v.to_string(),
+            "system_name" => cfg.api.system_name = v.to_string(),
+            "system_id" if v.is_empty() => return Err(err("system_id must not be empty".into())),
+            "system_id" => cfg.api.system_id = v.to_string(),
+            "aircon_name" => cfg.api.aircon_name = v.to_string(),
+            "zone_names" => {
+                let names: Vec<String> = v.split(',').map(|n| n.trim().to_string()).collect();
+                if names.len() > crate::registers::MAX_ZONES as usize {
+                    return Err(err("zone_names has more than 10 names".into()));
+                }
+                cfg.api.zone_names = names;
+            }
             "mode" => cfg.mode = parse_mode(v).map_err(err)?,
             "log_level" => cfg.log_level = v.parse().map_err(err)?,
             other => return Err(format!("line {line_no}: unknown key {other:?}")),
@@ -214,7 +233,8 @@ mod tests {
             assert_eq!(p, Path::new("/x.conf"));
             Ok(
                 "# comment\nport = \"/dev/serial/by-id/usb-x#1\"  # trailing\n\
-                mode = active\nlog_level='debug'\n\nhttp_bind = 127.0.0.1:2025\n"
+                mode = active\nlog_level='debug'\n\nhttp_bind = 127.0.0.1:2025\n\
+                system_name = Home\nzone_names = \"Living, Bed 1,,Study\"\n"
                     .to_string(),
             )
         };
@@ -223,6 +243,9 @@ mod tests {
         assert_eq!(c.mode, TxMode::Active);
         assert_eq!(c.log_level, Level::Debug);
         assert_eq!(c.http_bind, "127.0.0.1:2025");
+        assert_eq!(c.api.system_name, "Home");
+        assert_eq!(c.api.zone_names, ["Living", "Bed 1", "", "Study"]);
+        assert_eq!(c.api.system_id, "ductbridge");
 
         let c = run("--config=/x.conf --listen-only --port /dev/ttyUSB1", file).unwrap();
         assert_eq!(c.mode, TxMode::ListenOnly);
@@ -251,6 +274,10 @@ mod tests {
         assert!(run("--listen-only=1", no_file).is_err());
         let bad = |_: &Path| Ok("mode = transmit".to_string());
         assert!(run("", bad).unwrap_err().contains("line 1"));
+        let bad = |_: &Path| Ok("zone_names = a,b,c,d,e,f,g,h,i,j,k".to_string());
+        assert!(run("", bad).unwrap_err().contains("more than 10"));
+        let bad = |_: &Path| Ok("system_id = \"\"".to_string());
+        assert!(run("", bad).is_err());
         let bad = |_: &Path| Ok("colour = blue".to_string());
         assert!(run("", bad).unwrap_err().contains("unknown key"));
     }

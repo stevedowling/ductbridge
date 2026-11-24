@@ -3,12 +3,13 @@
 //! Listen-only unless configured with `mode = "active"` or `--active`.
 //! See `ductbridge --help` and `packaging/INSTALL.md`.
 
+use std::net::TcpListener;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use ductbridge::bridge::{run, Bridge, TxMode};
 use ductbridge::config::{self, Action, Config};
-use ductbridge::{log, log_error, log_info, log_warn};
+use ductbridge::{http, log, log_error, log_info, log_warn};
 
 /// Wait between attempts to (re)open the serial port.
 const REOPEN_DELAY: Duration = Duration::from_secs(5);
@@ -57,13 +58,21 @@ fn main() -> ExitCode {
             "active mode: answering control-box Pings; the original tablet must be unplugged"
         ),
     }
-    log_info!(
-        "HTTP API ({}) is not implemented yet (milestone 3)",
-        cfg.http_bind
-    );
-
-    // The handle is for the HTTP API (milestone 3).
-    let (mut bridge, _handle) = Bridge::new(cfg.mode, Instant::now());
+    let (mut bridge, handle) = Bridge::new(cfg.mode, Instant::now());
+    if cfg.http_bind == "off" {
+        log_info!("HTTP API disabled");
+    } else {
+        let listener = match TcpListener::bind(&cfg.http_bind) {
+            Ok(l) => l,
+            Err(e) => {
+                log_error!("cannot listen on {}: {e}", cfg.http_bind);
+                return ExitCode::FAILURE;
+            }
+        };
+        log_info!("HTTP API listening on {}", cfg.http_bind);
+        let info = cfg.api.clone();
+        std::thread::spawn(move || http::serve(listener, handle, info));
+    }
     let mut first = true;
     loop {
         match open(&cfg) {
