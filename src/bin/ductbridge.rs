@@ -19,8 +19,6 @@ const READ_TIMEOUT: Duration = Duration::from_millis(20);
 /// Feature evaluation interval (also run whenever the tablet-side state
 /// changes).
 const EVALUATE_EVERY: Duration = Duration::from_secs(30);
-/// On/off timers count in minutes.
-const TIMER_TICK: Duration = Duration::from_secs(60);
 
 /// Is the system clock synchronised (by NTP, e.g. systemd-timesyncd)?
 /// A Pi has no battery-backed clock, so after boot it can be wrong until
@@ -65,17 +63,27 @@ fn controller(handle: Handle, state_file: Option<PathBuf>) {
     let (mut saved, _) = handle.app();
     let mut evaluated = u64::MAX;
     let mut last_eval = Instant::now();
-    let mut last_tick = Instant::now();
+    let mut last_second = Instant::now();
+    let mut timers = features::TimerClock::default();
     let mut clock_warned = false;
+    let mut save_failing = false;
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let now = Instant::now();
-        if now.duration_since(last_tick) >= TIMER_TICK {
-            last_tick += TIMER_TICK;
-            report(
-                "timers",
-                handle.submit(now, |st| Ok(features::tick_timers(st, now))),
-            );
+        let secs = now.duration_since(last_second).as_secs() as u32;
+        if secs > 0 {
+            last_second += Duration::from_secs(secs as u64);
+            let due = timers.advance(&handle.app().1, secs);
+            if due.any() {
+                let r = handle.submit(now, |st| Ok(features::tick_timers(st, now, due)));
+                // Applied, or a no-op because the bus is not ready (pause):
+                // either way that minute is used. Refused (listen-only or
+                // starting up): it stays due and is retried next second.
+                if r.is_ok() {
+                    timers.ticked(&handle.app().1, due);
+                }
+                report("timers", r);
+            }
         }
         let (version, _) = handle.app();
         if version != evaluated || now.duration_since(last_eval) >= EVALUATE_EVERY {
@@ -99,13 +107,26 @@ fn controller(handle: Handle, state_file: Option<PathBuf>) {
         }
         let (version, app) = handle.app();
         if version != saved {
-            if let Some(path) = &state_file {
-                match state::save(path, &app) {
-                    Ok(()) => log_debug!("saved {}", path.display()),
-                    Err(e) => log_error!("cannot save {}: {e}", path.display()),
-                }
+            match &state_file {
+                Some(path) => match state::save(path, &app) {
+                    Ok(()) => {
+                        log_debug!("saved {}", path.display());
+                        if save_failing {
+                            log_info!("saved {} again", path.display());
+                        }
+                        save_failing = false;
+                        saved = version;
+                    }
+                    // Not marked saved: retried every second until it works.
+                    Err(e) => {
+                        if !save_failing {
+                            log_error!("cannot save {}: {e} (retrying)", path.display());
+                        }
+                        save_failing = true;
+                    }
+                },
+                None => saved = version,
             }
-            saved = version;
         }
     }
 }

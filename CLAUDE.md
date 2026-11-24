@@ -124,7 +124,7 @@ Safety choices already implemented:
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
 - Milestone 3 (done): HTTP API, then official-app compatibility and the
-  tablet-side features. 107 tests passing; smoke-tested end to end (fake CB
+  tablet-side features. 113 tests passing; smoke-tested end to end (fake CB
   on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -218,9 +218,11 @@ State in `AppState` (`src/state.rs`), persisted to `state_file` (default
 the daemon's controller thread when `app_version` changes. Missing or
 corrupt file → defaults + warning; out-of-range values repaired on load.
 The controller runs `features::evaluate` every 30 s and on every state
-change, and `features::tick_timers` every 60 s, both through
-`Handle::submit` (so nothing runs in listen-only mode or before Steady;
-timers pause then). Local time comes from libc `localtime_r`, and only
+change, and timers once per second through `features::TimerClock` (each
+timer's minute runs from when it was set; `tick_timers` decrements only
+the due ones), all through `Handle::submit` (so nothing runs in
+listen-only mode or before Steady; timers pause then). A failed save is
+retried every second (logged once). Local time comes from libc `localtime_r`, and only
 while the kernel reports the clock NTP-synchronised (`adjtimex` ≠
 TIME_ERROR; a Pi has no RTC). Unsynchronised → `evaluate(.., None)`: quiet
 night does not start, a running one waits, and the daemon warns once. The
@@ -248,6 +250,13 @@ control must not depend on the internet).
   when disabled: restores mode/fan/setpoint/MyZone/fresh air and zones,
   leaves on/off as is (whether the original turns the unit off is
   unverified). Climate control and MyAuto pause while it runs.
+- Quiet night start/end writes are tracked as a `Transition` of `Step`s
+  (target + replaced value, persisted) until the box reflects each one. A
+  dropped write (not pending, register still shows the replaced value) is
+  reissued; a register changed by someone else is left alone; given up
+  after 20 evaluations (~10 min). Climate control and MyAuto wait while a
+  transition is in progress. Saved/transition payloads are range-checked
+  on load (invalid ones discarded).
 
 ### Verify on install day
 

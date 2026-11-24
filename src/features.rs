@@ -20,7 +20,9 @@ use std::time::Instant;
 use crate::api::{view, write, View};
 use crate::bridge::{BusState, Plan};
 use crate::registers::{SystemStatus, ZoneState};
-use crate::state::{targets_valid, AppState, Saved, DEFAULT_COOL_TARGET, DEFAULT_HEAT_TARGET};
+use crate::state::{
+    targets_valid, AppState, Saved, Step, Transition, DEFAULT_COOL_TARGET, DEFAULT_HEAT_TARGET,
+};
 
 const MODE_COOL: u8 = 1;
 const MODE_HEAT: u8 = 2;
@@ -30,6 +32,9 @@ const QUIET_SET_TEMP: u8 = 32;
 /// Quiet night window, local time, minutes after midnight.
 pub const QUIET_START: u16 = 22 * 60;
 pub const QUIET_END: u16 = 6 * 60;
+/// Evaluations (30 s apart) a quiet-night transition may take before it is
+/// given up: about 10 minutes.
+pub const TRANSITION_ATTEMPTS: u32 = 20;
 
 fn wire(t: f32) -> u8 {
     (t * 2.0).round() as u8
@@ -134,12 +139,19 @@ pub fn evaluate(st: &BusState, now: Instant, minute: Option<u16>) -> Plan {
     };
     let mut app = st.app.clone();
     let mut plan = Plan::default();
-    quiet_night(&v, &mut app, minute, &mut plan);
-    let r = running_in(&v, &app);
-    if r.my_auto {
-        my_auto(&v, &mut app, &mut plan);
-    } else if r.climate_control {
-        climate_control(&v, &mut plan);
+    advance_transition(&v, &mut app, &mut plan);
+    if app.quiet_night_transition.is_none() {
+        quiet_night(&v, &mut app, minute, &mut plan);
+    }
+    // While quiet night is starting or ending, the other features wait:
+    // they would build on the values being replaced.
+    if app.quiet_night_transition.is_none() && plan.writes.is_empty() {
+        let r = running_in(&v, &app);
+        if r.my_auto {
+            my_auto(&v, &mut app, &mut plan);
+        } else if r.climate_control {
+            climate_control(&v, &mut plan);
+        }
     }
     if app != st.app {
         plan.app = Some(app);
@@ -147,10 +159,85 @@ pub fn evaluate(st: &BusState, now: Instant, minute: Option<u16>) -> Plan {
     plan
 }
 
+/// Does `read` show `target` for the bytes a write sets?
+fn shows(register: u8, read: &[u8; 7], target: &[u8; 7]) -> bool {
+    if register == SystemStatus::REG {
+        read[1..6] == target[1..6]
+    } else {
+        read[1] == target[1] && read[3] == target[3]
+    }
+}
+
+/// The write for a step, built on the current desired value (status keeps
+/// its on/off and RF id; zones use the write format).
+fn step_write(v: &View, step: &Step) -> crate::record::Record {
+    if step.register == SystemStatus::REG {
+        let mut s = desired_status(v).unwrap_or(step.target);
+        s[1..6].copy_from_slice(&step.target[1..6]);
+        write(v.unit, SystemStatus::REG, s)
+    } else {
+        let t = step.target;
+        zone_write(v, step.zone, t[1] & 0x80 != 0, t[1], t[3])
+    }
+}
+
+/// Follow a quiet-night start/end until the box reflects every write. A
+/// dropped write (no longer pending, register unchanged) is reissued; a
+/// register the user has changed since is left alone.
+fn advance_transition(v: &View, app: &mut AppState, plan: &mut Plan) {
+    let Some(mut t) = app.quiet_night_transition.take() else {
+        return;
+    };
+    t.attempts += 1;
+    let mut left = Vec::new();
+    for step in t.steps {
+        let key = (v.unit.0, v.unit.1, step.register, step.zone);
+        let Some(read) = v.st.registers.get(&key).map(|r| r.payload) else {
+            continue;
+        };
+        if shows(step.register, &read, &step.target) {
+            continue; // done
+        }
+        if v.st.pending.contains_key(&key) {
+            left.push(step); // still on its way
+        } else if shows(step.register, &read, &step.from) {
+            plan.writes.push(step_write(v, &step)); // dropped: reissue
+            left.push(step);
+        }
+        // else: changed by someone else since; leave it.
+    }
+    if left.is_empty() {
+        return;
+    }
+    if t.attempts > TRANSITION_ATTEMPTS {
+        plan.log.push(format!(
+            "quiet night: {} change(s) never reflected by the control box; giving up",
+            left.len()
+        ));
+        plan.writes.clear();
+        return;
+    }
+    if !plan.writes.is_empty() {
+        plan.log
+            .push("quiet night: reissuing writes the control box dropped".into());
+    }
+    app.quiet_night_transition = Some(Transition {
+        steps: left,
+        attempts: t.attempts,
+    });
+}
+
+/// Queue a write and record it as a step of the current transition.
+fn transition_write(v: &View, steps: &mut Vec<Step>, plan: &mut Plan, step: Step) {
+    plan.writes.push(step_write(v, &step));
+    steps.push(step);
+}
+
 fn quiet_night(v: &View, app: &mut AppState, minute: Option<u16>, plan: &mut Plan) {
     let Some(p) = desired_status(v) else { return };
     // Unknown time: neither in nor out of the window.
     let in_window = minute.map(in_quiet_window);
+    let mut steps = Vec::new();
     if app.quiet_night_running && (!app.quiet_night_enabled || in_window == Some(false)) {
         // Restore what quiet night replaced; on/off stays as it is now
         // (whether the original also turns the unit off is unverified).
@@ -158,13 +245,25 @@ fn quiet_night(v: &View, app: &mut AppState, minute: Option<u16>, plan: &mut Pla
             let mut s = p;
             s[1..6].copy_from_slice(&saved.status[1..6]);
             if s != p {
-                plan.writes.push(write(v.unit, SystemStatus::REG, s));
+                let step = Step {
+                    register: SystemStatus::REG,
+                    zone: 0,
+                    target: s,
+                    from: p,
+                };
+                transition_write(v, &mut steps, plan, step);
             }
             for z in zones(v) {
                 if let Some((_, sp)) = saved.zones.iter().find(|(n, _)| *n == z.n) {
                     if sp[1] != z.p[1] || sp[3] != z.p[3] {
-                        plan.writes
-                            .push(zone_write(v, z.n, sp[1] & 0x80 != 0, sp[1], sp[3]));
+                        let target = [z.n, sp[1], 0, sp[3], 0, 0, 0];
+                        let step = Step {
+                            register: ZoneState::REG,
+                            zone: z.n,
+                            target,
+                            from: z.p,
+                        };
+                        transition_write(v, &mut steps, plan, step);
                     }
                 }
             }
@@ -174,16 +273,14 @@ fn quiet_night(v: &View, app: &mut AppState, minute: Option<u16>, plan: &mut Pla
             "quiet night: ended, previous settings restored (unit left on/off as is; unverified)"
                 .into(),
         );
-        return;
-    }
-    // Start while in the window and cooling (cool, or MyAuto cooling, which
-    // is "cool" on the bus). Exact trigger unverified.
-    if !app.quiet_night_running
+    } else if !app.quiet_night_running
         && app.quiet_night_enabled
         && in_window == Some(true)
         && p[0] == 1
         && p[1] == MODE_COOL
     {
+        // Start while in the window and cooling (cool, or MyAuto cooling,
+        // which is "cool" on the bus). Exact trigger unverified.
         let zs = zones(v);
         app.quiet_night_saved = Some(Saved {
             status: p,
@@ -195,17 +292,34 @@ fn quiet_night(v: &View, app: &mut AppState, minute: Option<u16>, plan: &mut Pla
         if s[4] == 0 {
             s[3] = QUIET_SET_TEMP;
         }
-        plan.writes.push(write(v.unit, SystemStatus::REG, s));
+        let step = Step {
+            register: SystemStatus::REG,
+            zone: 0,
+            target: s,
+            from: p,
+        };
+        transition_write(v, &mut steps, plan, step);
         for z in zs {
-            if z.has_sensor && z.p[3] != QUIET_SET_TEMP {
-                plan.writes
-                    .push(zone_write(v, z.n, z.open(), z.p[1], QUIET_SET_TEMP));
+            let target = if z.has_sensor && z.p[3] != QUIET_SET_TEMP {
+                [z.n, z.p[1], 0, QUIET_SET_TEMP, 0, 0, 0]
             } else if !z.has_sensor && z.open() && z.p[1] & 0x7f != 100 {
-                plan.writes.push(zone_write(v, z.n, true, 100, z.p[3]));
-            }
+                [z.n, 0x80 | 100, 0, z.p[3], 0, 0, 0]
+            } else {
+                continue;
+            };
+            let step = Step {
+                register: ZoneState::REG,
+                zone: z.n,
+                target,
+                from: z.p,
+            };
+            transition_write(v, &mut steps, plan, step);
         }
         plan.log
             .push("quiet night: started, fan only until 06:00 (trigger unverified)".into());
+    }
+    if !steps.is_empty() {
+        app.quiet_night_transition = Some(Transition { steps, attempts: 0 });
     }
 }
 
@@ -311,11 +425,70 @@ fn my_auto(v: &View, app: &mut AppState, plan: &mut Plan) {
     }
 }
 
-/// Once a minute: count the on/off timers down and fire them at zero.
-/// Timers pause (no countdown) while the bus is not ready.
-pub fn tick_timers(st: &BusState, now: Instant) -> Plan {
+/// Which timers have had a full minute since they were set or last counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Due {
+    pub on: bool,
+    pub off: bool,
+}
+
+impl Due {
+    pub fn any(self) -> bool {
+        self.on || self.off
+    }
+}
+
+/// Measures each timer's minutes from when it was set, not from daemon
+/// start, so a 1-minute timer always runs a full minute. A value the clock
+/// did not produce itself (a client set the timer) restarts its minute.
+#[derive(Debug, Clone, Default)]
+pub struct TimerClock {
+    elapsed: [u32; 2],
+    seen: [u32; 2],
+}
+
+impl TimerClock {
+    /// Advance by `secs` of wall time and report which timers are due.
+    pub fn advance(&mut self, app: &AppState, secs: u32) -> Due {
+        let values = [app.count_down_to_on, app.count_down_to_off];
+        for (i, &v) in values.iter().enumerate() {
+            if v == 0 {
+                self.elapsed[i] = 0;
+                self.seen[i] = 0;
+                continue;
+            }
+            if v != self.seen[i] {
+                self.seen[i] = v;
+                self.elapsed[i] = 0;
+            }
+            // Capped: a minute that ends while the bus is not ready counts
+            // once, as soon as it is ready again.
+            self.elapsed[i] = (self.elapsed[i] + secs).min(60);
+        }
+        Due {
+            on: values[0] > 0 && self.elapsed[0] >= 60,
+            off: values[1] > 0 && self.elapsed[1] >= 60,
+        }
+    }
+
+    /// Call after `tick_timers` for `due` was applied (or did nothing
+    /// because the bus was not ready): restart those timers' minutes.
+    pub fn ticked(&mut self, app: &AppState, due: Due) {
+        let values = [app.count_down_to_on, app.count_down_to_off];
+        for (i, d) in [due.on, due.off].into_iter().enumerate() {
+            if d {
+                self.elapsed[i] = 0;
+                self.seen[i] = values[i];
+            }
+        }
+    }
+}
+
+/// Count down the timers that are `due` by one minute and fire them at
+/// zero. Timers pause (no countdown) while the bus is not ready.
+pub fn tick_timers(st: &BusState, now: Instant, due: Due) -> Plan {
     let app0 = &st.app;
-    if app0.count_down_to_on == 0 && app0.count_down_to_off == 0 {
+    if !due.any() {
         return Plan::default();
     }
     let Ok(v) = view(st, now) else {
@@ -327,7 +500,7 @@ pub fn tick_timers(st: &BusState, now: Instant) -> Plan {
     let mut app = app0.clone();
     let mut plan = Plan::default();
     let mut s = p;
-    if app.count_down_to_on > 0 {
+    if due.on && app.count_down_to_on > 0 {
         app.count_down_to_on -= 1;
         if app.count_down_to_on == 0 {
             s[0] = 1;
@@ -335,7 +508,7 @@ pub fn tick_timers(st: &BusState, now: Instant) -> Plan {
                 .push("timer: countDownToOn reached 0, turning on".into());
         }
     }
-    if app.count_down_to_off > 0 {
+    if due.off && app.count_down_to_off > 0 {
         app.count_down_to_off -= 1;
         if app.count_down_to_off == 0 {
             s[0] = 0;
@@ -346,7 +519,9 @@ pub fn tick_timers(st: &BusState, now: Instant) -> Plan {
     if s != p {
         plan.writes.push(write(v.unit, SystemStatus::REG, s));
     }
-    plan.app = Some(app);
+    if app != *app0 {
+        plan.app = Some(app);
+    }
     plan
 }
 
@@ -410,6 +585,57 @@ mod tests {
     }
 
     const NOON: u16 = 12 * 60;
+    const BOTH: Due = Due {
+        on: true,
+        off: true,
+    };
+
+    #[test]
+    fn a_timer_set_late_in_a_minute_still_runs_a_full_minute() {
+        let mut clock = TimerClock::default();
+        let mut app = AppState::default();
+        // 59 s pass with no timer; then a 1-minute timer is set.
+        assert_eq!(clock.advance(&app, 59), Due::default());
+        app.count_down_to_off = 1;
+        assert!(!clock.advance(&app, 1).off, "1 s after setting: not due");
+        assert!(!clock.advance(&app, 58).off);
+        assert!(clock.advance(&app, 1).off, "60 s after setting: due");
+        // After the tick (value now 0) nothing is due.
+        app.count_down_to_off = 0;
+        clock.ticked(
+            &app,
+            Due {
+                on: false,
+                off: true,
+            },
+        );
+        assert_eq!(clock.advance(&app, 60), Due::default());
+    }
+
+    #[test]
+    fn timer_clock_counts_each_minute_and_restarts_when_reset() {
+        let mut clock = TimerClock::default();
+        let mut app = AppState {
+            count_down_to_on: 3,
+            count_down_to_off: 2,
+            ..AppState::default()
+        };
+        assert_eq!(clock.advance(&app, 60), BOTH);
+        app.count_down_to_on = 2; // as tick_timers would
+        app.count_down_to_off = 1;
+        clock.ticked(&app, BOTH);
+        assert!(!clock.advance(&app, 30).any());
+        // A client resets the on timer: its minute restarts, off's does not.
+        app.count_down_to_on = 10;
+        let due = clock.advance(&app, 30);
+        assert!(!due.on && due.off);
+        // A long gap (bus not ready): each timer is due once, not ten times.
+        assert_eq!(clock.advance(&app, 600), BOTH);
+        app.count_down_to_on = 9;
+        app.count_down_to_off = 0;
+        clock.ticked(&app, BOTH);
+        assert_eq!(clock.advance(&app, 59), Due::default());
+    }
 
     #[test]
     fn timers_count_down_and_fire() {
@@ -420,14 +646,14 @@ mod tests {
             ..AppState::default()
         };
         let st = bus(&s(true, MODE_COOL, 24.0, 0), &zones, app);
-        let p = tick_timers(&st, Instant::now());
+        let p = tick_timers(&st, Instant::now(), BOTH);
         assert!(p.writes.is_empty());
         let st = BusState {
             app: p.app.unwrap(),
             ..st
         };
         assert_eq!(st.app.count_down_to_off, 1);
-        let p = tick_timers(&st, Instant::now());
+        let p = tick_timers(&st, Instant::now(), BOTH);
         assert_eq!(status_write(&p).unwrap()[0], 0, "turned off");
         assert_eq!(p.app.as_ref().unwrap().count_down_to_off, 0);
         assert!(p.log[0].contains("countDownToOff"));
@@ -437,12 +663,12 @@ mod tests {
             ..AppState::default()
         };
         let st = bus(&s(false, MODE_COOL, 24.0, 0), &zones, app);
-        let p = tick_timers(&st, Instant::now());
+        let p = tick_timers(&st, Instant::now(), BOTH);
         assert_eq!(status_write(&p).unwrap()[0], 1, "turned on");
 
         // Nothing set: nothing happens.
         let st = bus(&s(false, MODE_COOL, 24.0, 0), &zones, AppState::default());
-        assert_eq!(tick_timers(&st, Instant::now()), Plan::default());
+        assert_eq!(tick_timers(&st, Instant::now(), BOTH), Plan::default());
     }
 
     #[test]
@@ -450,7 +676,7 @@ mod tests {
         let (_b, h) = Bridge::new(TxMode::ListenOnly, Instant::now());
         let mut st = h.snapshot();
         st.app.count_down_to_off = 3;
-        assert_eq!(tick_timers(&st, Instant::now()), Plan::default());
+        assert_eq!(tick_timers(&st, Instant::now(), BOTH), Plan::default());
     }
 
     fn cc() -> AppState {
@@ -604,6 +830,15 @@ mod tests {
         ]
     }
 
+    /// The zones once quiet night's writes are reflected.
+    fn night_zones() -> [String; 3] {
+        [
+            z(1, true, 100, true, 16.0, Some(26.0)),
+            z(2, true, 100, false, 23.0, None),
+            z(3, false, 0, false, 23.0, None),
+        ]
+    }
+
     #[test]
     fn quiet_night_window_boundaries() {
         let status = s(true, MODE_COOL, 23.0, 0);
@@ -630,11 +865,15 @@ mod tests {
         // 05:59: still running; climate control paused, nothing written.
         let st = BusState {
             app: app.clone(),
-            ..bus(&s(true, MODE_VENT, 16.0, 0), &quiet_zones(), quiet())
+            ..bus(&s(true, MODE_VENT, 16.0, 0), &night_zones(), quiet())
         };
         assert!(running(&st, Instant::now()).quiet_night);
         let p = evaluate(&st, Instant::now(), Some(QUIET_END - 1));
-        assert!(p.writes.is_empty() && p.app.is_none());
+        // The start is reflected: the transition completes, nothing written.
+        assert!(p.writes.is_empty());
+        let app = p.app.unwrap();
+        assert!(app.quiet_night_running && app.quiet_night_transition.is_none());
+        let st = BusState { app, ..st };
 
         // 06:00: restored (mode, setpoint), unit left on.
         let p = evaluate(&st, Instant::now(), Some(QUIET_END));
@@ -685,7 +924,7 @@ mod tests {
         app.quiet_night_enabled = false;
         let st = BusState {
             app,
-            ..bus(&s(true, MODE_VENT, 16.0, 0), &quiet_zones(), quiet())
+            ..bus(&s(true, MODE_VENT, 16.0, 0), &night_zones(), quiet())
         };
         let p = evaluate(&st, Instant::now(), Some(23 * 60 + 5));
         assert_eq!(status_write(&p).unwrap()[1], MODE_COOL);
@@ -702,10 +941,13 @@ mod tests {
         let app = evaluate(&st, Instant::now(), Some(23 * 60)).app.unwrap();
         let st = BusState {
             app,
-            ..bus(&s(true, MODE_VENT, 16.0, 0), &quiet_zones(), quiet())
+            ..bus(&s(true, MODE_VENT, 16.0, 0), &night_zones(), quiet())
         };
         let p = evaluate(&st, Instant::now(), None);
-        assert!(p.writes.is_empty() && p.app.is_none());
+        assert!(p.writes.is_empty());
+        let app = p.app.unwrap(); // only the completed start transition
+        assert!(app.quiet_night_running && app.quiet_night_transition.is_none());
+        let st = BusState { app, ..st };
         // ...but disabling still restores at once.
         let mut app = st.app.clone();
         app.quiet_night_enabled = false;
@@ -714,6 +956,134 @@ mod tests {
             status_write(&evaluate(&st, Instant::now(), None)).unwrap()[1],
             MODE_COOL
         );
+    }
+
+    #[test]
+    fn dropped_quiet_night_writes_are_reissued() {
+        let st = bus(&s(true, MODE_COOL, 23.0, 0), &quiet_zones(), quiet());
+        let app = evaluate(&st, Instant::now(), Some(23 * 60)).app.unwrap();
+        assert_eq!(app.quiet_night_transition.as_ref().unwrap().steps.len(), 3);
+        // Nothing reflected, nothing pending (the session dropped them).
+        let st = BusState { app, ..st };
+        let p = evaluate(&st, Instant::now(), Some(23 * 60 + 1));
+        assert_eq!(status_write(&p).unwrap()[1], MODE_VENT);
+        assert_eq!(zone_writes(&p).len(), 2);
+        assert!(p.log.iter().any(|l| l.contains("reissuing")));
+        // Still on their way (pending): wait, write nothing.
+        let mut st = BusState {
+            app: p.app.clone().unwrap(),
+            ..st
+        };
+        for r in &p.writes {
+            st.pending.insert(
+                crate::session::key_of(r),
+                crate::bridge::Pending {
+                    record: *r,
+                    seq: 1,
+                    accepted: Instant::now(),
+                    confirmed: false,
+                },
+            );
+        }
+        let p = evaluate(&st, Instant::now(), Some(23 * 60 + 2));
+        assert!(p.writes.is_empty());
+        assert_eq!(p.app.unwrap().quiet_night_transition.unwrap().attempts, 2);
+    }
+
+    #[test]
+    fn transition_leaves_user_changes_alone_and_gives_up() {
+        let st = bus(&s(true, MODE_COOL, 23.0, 0), &quiet_zones(), quiet());
+        let app = evaluate(&st, Instant::now(), Some(23 * 60)).app.unwrap();
+        // The user switched to heat and changed the zones meanwhile: none of
+        // quiet night's writes is reissued over that.
+        let changed = [
+            z(1, true, 100, true, 21.0, Some(26.0)),
+            z(2, true, 70, false, 23.0, None),
+            z(3, false, 0, false, 23.0, None),
+        ];
+        let st = BusState {
+            app: app.clone(),
+            ..bus(&s(true, MODE_HEAT, 23.0, 0), &changed, quiet())
+        };
+        let p = evaluate(&st, Instant::now(), Some(23 * 60 + 1));
+        assert!(p.writes.is_empty());
+        assert!(p.app.unwrap().quiet_night_transition.is_none());
+        // Never reflected and never dropped (always pending): give up.
+        let mut app = app;
+        app.quiet_night_transition.as_mut().unwrap().attempts = TRANSITION_ATTEMPTS;
+        let mut st = BusState {
+            app,
+            ..bus(&s(true, MODE_COOL, 23.0, 0), &quiet_zones(), quiet())
+        };
+        let w = write((7, 0xabcde), SystemStatus::REG, [1, 3, 3, 32, 0, 1, 0]);
+        st.pending.insert(
+            crate::session::key_of(&w),
+            crate::bridge::Pending {
+                record: w,
+                seq: 1,
+                accepted: Instant::now(),
+                confirmed: false,
+            },
+        );
+        let p = evaluate(&st, Instant::now(), Some(23 * 60 + 2));
+        assert!(p.log.iter().any(|l| l.contains("giving up")));
+        assert!(p.app.unwrap().quiet_night_transition.is_none());
+    }
+
+    #[test]
+    fn my_auto_waits_for_the_quiet_night_restore() {
+        let app = AppState {
+            quiet_night_enabled: true,
+            ..my_auto(true)
+        };
+        let st = bus(&s(true, MODE_COOL, 24.0, 0), &quiet_zones(), app);
+        let app = evaluate(&st, Instant::now(), Some(23 * 60)).app.unwrap();
+        // Overnight: quiet values reflected, fan changed by the user.
+        let night = format!(
+            "0703abcde05{:02x}{:02x}01{:02x}000100",
+            1, MODE_VENT, QUIET_SET_TEMP
+        );
+        let st = BusState {
+            app,
+            ..bus(&night, &night_zones(), AppState::default())
+        };
+        let st = BusState {
+            app: evaluate(&st, Instant::now(), Some(QUIET_START + 10))
+                .app
+                .unwrap_or(st.app.clone()),
+            ..st
+        };
+        assert!(st.app.quiet_night_transition.is_none(), "start completed");
+        // 06:00: only the restore is written, fan back to the saved high.
+        let p = evaluate(&st, Instant::now(), Some(QUIET_END));
+        let sw = status_write(&p).unwrap();
+        assert_eq!((sw[1], sw[2]), (MODE_COOL, 3));
+        assert_eq!(
+            p.writes
+                .iter()
+                .filter(|r| r.register == SystemStatus::REG)
+                .count(),
+            1
+        );
+        // Next round, restore still pending: MyAuto does not write yet.
+        let mut st = BusState {
+            app: p.app.unwrap(),
+            ..st
+        };
+        for r in &p.writes {
+            st.pending.insert(
+                crate::session::key_of(r),
+                crate::bridge::Pending {
+                    record: *r,
+                    seq: 1,
+                    accepted: Instant::now(),
+                    confirmed: false,
+                },
+            );
+        }
+        assert!(evaluate(&st, Instant::now(), Some(QUIET_END + 1))
+            .writes
+            .is_empty());
     }
 
     #[test]
@@ -730,7 +1100,7 @@ mod tests {
             app,
             ..bus(
                 &s(true, MODE_VENT, 16.0, 0),
-                &quiet_zones(),
+                &night_zones(),
                 AppState::default(),
             )
         };

@@ -38,6 +38,28 @@ pub struct Saved {
     pub zones: Vec<(u8, [u8; 7])>,
 }
 
+/// One register change a quiet-night transition (start or end) is waiting
+/// to see reflected by the control box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Step {
+    pub register: u8,
+    /// Zone number for register 03, else 0.
+    pub zone: u8,
+    /// The payload written.
+    pub target: [u8; 7],
+    /// The payload it replaced. A dropped write is only reissued while the
+    /// register still shows this, so a user's later change is never undone.
+    pub from: [u8; 7],
+}
+
+/// A quiet-night start or end still being carried out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transition {
+    pub steps: Vec<Step>,
+    /// Evaluations so far; given up after a limit.
+    pub attempts: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppState {
@@ -57,6 +79,8 @@ pub struct AppState {
     pub quiet_night_enabled: bool,
     pub quiet_night_running: bool,
     pub quiet_night_saved: Option<Saved>,
+    /// Quiet night start/end writes not yet reflected by the control box.
+    pub quiet_night_transition: Option<Transition>,
 }
 
 impl Default for AppState {
@@ -74,7 +98,26 @@ impl Default for AppState {
             quiet_night_enabled: false,
             quiet_night_running: false,
             quiet_night_saved: None,
+            quiet_night_transition: None,
         }
+    }
+}
+
+/// Is a saved or target payload in range for its register?
+fn payload_valid(register: u8, payload: [u8; 7]) -> bool {
+    use crate::record::{Record, DEST_CB};
+    use crate::registers::{SystemStatus, ZoneState};
+    let r = Record {
+        unit_type: crate::record::UNIT_AIRCON,
+        dest: DEST_CB,
+        uid: 0,
+        register,
+        payload,
+    };
+    match register {
+        SystemStatus::REG => SystemStatus::decode(&r).is_ok(),
+        ZoneState::REG => ZoneState::decode(&r).is_ok(),
+        _ => false,
     }
 }
 
@@ -136,6 +179,27 @@ impl AppState {
                     self.names.zones.insert(n, c);
                 }
                 _ => fixed.push(format!("dropped zone {n} name {s:?}")),
+            }
+        }
+        // Never restore or reissue out-of-range bytes onto the bus.
+        if let Some(saved) = &self.quiet_night_saved {
+            let ok = payload_valid(crate::registers::SystemStatus::REG, saved.status)
+                && saved.zones.iter().all(|(n, p)| {
+                    p[0] == *n && payload_valid(crate::registers::ZoneState::REG, *p)
+                });
+            if !ok {
+                fixed.push("quiet night saved settings out of range; discarded".into());
+                self.quiet_night_saved = None;
+            }
+        }
+        if let Some(t) = &self.quiet_night_transition {
+            let ok = t
+                .steps
+                .iter()
+                .all(|s| payload_valid(s.register, s.target) && payload_valid(s.register, s.from));
+            if !ok {
+                fixed.push("quiet night transition out of range; discarded".into());
+                self.quiet_night_transition = None;
             }
         }
         if self.quiet_night_running && self.quiet_night_saved.is_none() {
@@ -262,6 +326,29 @@ mod tests {
         assert!(!s.names.zones.contains_key(&11));
         assert!(!s.quiet_night_running);
         assert_eq!(fixed.len(), 5, "{fixed:?}");
+    }
+
+    #[test]
+    fn invalid_quiet_night_payloads_are_discarded() {
+        // Fan 255 / setpoint 127.5 °C must never reach the bus.
+        let (s, fixed) = AppState::from_json(
+            r#"{"quietNightRunning": true,
+                "quietNightSaved": {"status": [1,1,255,255,0,1,0], "zones": []},
+                "quietNightTransition": {"steps": [{"register": 3, "zone": 1,
+                    "target": [1,228,0,200,0,0,0], "from": [1,228,0,48,0,0,0]}], "attempts": 0}}"#,
+        )
+        .unwrap();
+        assert!(s.quiet_night_saved.is_none());
+        assert!(s.quiet_night_transition.is_none());
+        assert!(!s.quiet_night_running);
+        assert_eq!(fixed.len(), 3, "{fixed:?}");
+        // Valid ones are kept.
+        let (s, fixed) = AppState::from_json(
+            r#"{"quietNightRunning": true,
+                "quietNightSaved": {"status": [1,1,3,48,0,1,0], "zones": [[2,[2,178,1,48,21,3,0]]]}}"#,
+        )
+        .unwrap();
+        assert!(s.quiet_night_running && fixed.is_empty(), "{fixed:?}");
     }
 
     #[test]
