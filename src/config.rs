@@ -112,26 +112,31 @@ pub fn apply_file(cfg: &mut Config, text: &str) -> Result<(), String> {
         let (k, v) = line
             .split_once('=')
             .ok_or_else(|| format!("line {line_no}: expected key = value"))?;
-        let v = unquote(v);
-        let err = |e: String| format!("line {line_no}: {e}");
-        match k.trim() {
-            "port" => cfg.port = v.to_string(),
-            "http_bind" => cfg.http_bind = v.to_string(),
-            "system_name" => cfg.api.system_name = v.to_string(),
-            "system_id" if v.is_empty() => return Err(err("system_id must not be empty".into())),
-            "system_id" => cfg.api.system_id = v.to_string(),
-            "aircon_name" => cfg.api.aircon_name = v.to_string(),
-            "zone_names" => {
-                let names: Vec<String> = v.split(',').map(|n| n.trim().to_string()).collect();
-                if names.len() > crate::registers::MAX_ZONES as usize {
-                    return Err(err("zone_names has more than 10 names".into()));
-                }
-                cfg.api.zone_names = names;
+        set(cfg, k.trim(), unquote(v)).map_err(|e| format!("line {line_no}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Set one setting by key. Shared by the file parser and command-line
+/// overrides, so both validate the same way.
+fn set(cfg: &mut Config, key: &str, v: &str) -> Result<(), String> {
+    match key {
+        "port" => cfg.port = v.to_string(),
+        "http_bind" => cfg.http_bind = v.to_string(),
+        "system_name" => cfg.api.system_name = v.to_string(),
+        "system_id" if v.is_empty() => return Err("system_id must not be empty".into()),
+        "system_id" => cfg.api.system_id = v.to_string(),
+        "aircon_name" => cfg.api.aircon_name = v.to_string(),
+        "zone_names" => {
+            let names: Vec<String> = v.split(',').map(|n| n.trim().to_string()).collect();
+            if names.len() > crate::registers::MAX_ZONES as usize {
+                return Err("zone_names has more than 10 names".into());
             }
-            "mode" => cfg.mode = parse_mode(v).map_err(err)?,
-            "log_level" => cfg.log_level = v.parse().map_err(err)?,
-            other => return Err(format!("line {line_no}: unknown key {other:?}")),
+            cfg.api.zone_names = names;
         }
+        "mode" => cfg.mode = parse_mode(v)?,
+        "log_level" => cfg.log_level = v.parse()?,
+        other => return Err(format!("unknown key {other:?}")),
     }
     Ok(())
 }
@@ -190,14 +195,9 @@ where
         },
     }
     for (k, v) in overrides {
-        // Reuse the file parser so both paths validate identically.
-        apply_file(&mut cfg, &format!("{k} = \"{v}\"")).map_err(|e| {
-            format!(
-                "--{}: {}",
-                k.replace('_', "-"),
-                e.trim_start_matches("line 1: ")
-            )
-        })?;
+        // Set directly (not by re-serialising a config line, where quotes
+        // or `#` in the value would be misparsed).
+        set(&mut cfg, &k, &v).map_err(|e| format!("--{}: {e}", k.replace('_', "-")))?;
     }
     Ok(Action::Run(cfg))
 }
@@ -250,6 +250,9 @@ mod tests {
         let c = run("--config=/x.conf --listen-only --port /dev/ttyUSB1", file).unwrap();
         assert_eq!(c.mode, TxMode::ListenOnly);
         assert_eq!(c.port, "/dev/ttyUSB1");
+        // CLI values are taken literally, quotes and '#' included.
+        let c = run("--port a\"#b", no_file).unwrap();
+        assert_eq!(c.port, "a\"#b");
     }
 
     #[test]

@@ -390,6 +390,11 @@ pub fn set_aircon(query: &str, st: &BusState, now: Instant) -> Result<Vec<Record
     Ok(out)
 }
 
+// Range checks apply to setpoints a client sends. A request that does not
+// change the setpoint resends the box's own current value as it is (zones
+// without a sensor may report 0), since refusing it would block e.g. a mode
+// change.
+
 fn info_write(v: &View, fields: &Map<String, Value>) -> Result<Option<Record>, String> {
     if fields.is_empty() {
         return Ok(None);
