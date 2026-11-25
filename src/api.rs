@@ -37,6 +37,10 @@ pub struct ApiInfo {
     /// `system.sysType`. The official app refuses a system whose type it
     /// does not know ("unable to determine system type").
     pub sys_type: String,
+    /// `system.myAppRev` (checked by [`check_my_app_rev`]).
+    pub my_app_rev: String,
+    /// `system.aaServiceRev`.
+    pub aa_service_rev: String,
     /// Zone names, zone 1 first. Missing ones default to "Zone N".
     pub zone_names: Vec<String>,
 }
@@ -48,6 +52,8 @@ impl Default for ApiInfo {
             system_id: "ductbridge".into(),
             aircon_name: "Aircon".into(),
             sys_type: DEFAULT_SYS_TYPE.into(),
+            my_app_rev: DEFAULT_MY_APP_REV.into(),
+            aa_service_rev: DEFAULT_AA_SERVICE_REV.into(),
             zone_names: Vec::new(),
         }
     }
@@ -79,10 +85,27 @@ impl ApiInfo {
     }
 }
 
-/// App revision reported to clients. The official app reads the number
-/// before the first `.` and only stores the system's `rid` when it is ≥ 13.
-pub fn my_app_rev() -> String {
-    format!("15.0+ductbridge.{}", env!("CARGO_PKG_VERSION"))
+/// Default `system.myAppRev` and `system.aaServiceRev`: what a current
+/// original tablet reports (observed). A lower revision makes the official
+/// app offer a tablet upgrade. The app reads the number before the first
+/// `.` and only stores the system's `rid` when it is ≥ 13.
+pub const DEFAULT_MY_APP_REV: &str = "15.1548";
+pub const DEFAULT_AA_SERVICE_REV: &str = "14.118";
+
+/// Check a configured `myAppRev`: `major.build`, major ≥ 13.
+pub fn check_my_app_rev(v: &str) -> Result<(), String> {
+    let ok = v.split_once('.').is_some_and(|(major, build)| {
+        major.parse::<u32>().is_ok_and(|m| m >= 13)
+            && !build.is_empty()
+            && build.bytes().all(|b| b.is_ascii_digit())
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "my_app_rev {v:?} (expected major.build, major ≥ 13, e.g. {DEFAULT_MY_APP_REV:?})"
+        ))
+    }
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -309,7 +332,8 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
             // The official app ignores a reply without mid, name and myAppRev.
             "mid": info.system_id,
             "sysType": info.sys_type,
-            "myAppRev": my_app_rev(),
+            "myAppRev": info.my_app_rev,
+            "aaServiceRev": info.aa_service_rev,
             "needsUpdate": false,
             "noOfAircons": 1,
             "hasAircons": true,
@@ -835,11 +859,15 @@ mod tests {
             system_id: "id1".into(),
             aircon_name: "Ducted".into(),
             sys_type: "e-zone".into(),
+            my_app_rev: "15.2000".into(),
+            aa_service_rev: "14.200".into(),
             zone_names: vec!["Living".into(), String::new()],
         };
         let d = sd(&state(), &info).unwrap();
         assert_eq!(d["system"]["name"], "Home");
         assert_eq!(d["system"]["sysType"], "e-zone");
+        assert_eq!(d["system"]["myAppRev"], "15.2000");
+        assert_eq!(d["system"]["aaServiceRev"], "14.200");
         assert_eq!(d["aircons"]["ac1"]["info"]["name"], "Ducted");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z01"]["name"], "Living");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z02"]["name"], "Zone 2");
@@ -1066,7 +1094,26 @@ mod tests {
         let rev = sys["myAppRev"].as_str().unwrap();
         let major: u32 = rev.split('.').next().unwrap().parse().unwrap();
         assert_eq!(major, 15);
-        assert!(rev.ends_with(env!("CARGO_PKG_VERSION")), "{rev}");
+        // Current tablet revisions: no "upgrade available" prompt.
+        assert_eq!(rev, "15.1548");
+        assert_eq!(sys["aaServiceRev"], "14.118");
+    }
+
+    #[test]
+    fn my_app_rev_is_checked() {
+        assert!(check_my_app_rev(DEFAULT_MY_APP_REV).is_ok());
+        assert!(check_my_app_rev("13.0").is_ok());
+        for bad in [
+            "",
+            "15",
+            "12.999",
+            "x.1",
+            "15.",
+            "15.1a",
+            "15.0+ductbridge.0.1.0",
+        ] {
+            assert!(check_my_app_rev(bad).is_err(), "{bad:?}");
+        }
     }
 
     fn uids(d: &Value) -> Vec<String> {

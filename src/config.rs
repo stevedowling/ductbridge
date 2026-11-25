@@ -13,6 +13,8 @@
 //! system_id = "ductbridge" # stable id; Home Assistant's unique id
 //! aircon_name = "Aircon"
 //! sys_type = "MyAir5"     # system type reported to apps
+//! my_app_rev = "15.1548"  # tablet app revision reported to apps
+//! aa_service_rev = "14.118"
 //! zone_names = "Living, Kitchen, Bed 1"   # zone 1 first, comma-separated
 //! ```
 
@@ -76,7 +78,7 @@ impl Default for Config {
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    Run(Config),
+    Run(Box<Config>),
     Help,
     Version,
 }
@@ -149,6 +151,12 @@ fn set(cfg: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "aircon_name" => cfg.api.aircon_name = v.to_string(),
         "sys_type" if v.is_empty() => return Err("sys_type must not be empty".into()),
         "sys_type" => cfg.api.sys_type = v.to_string(),
+        "my_app_rev" => {
+            crate::api::check_my_app_rev(v)?;
+            cfg.api.my_app_rev = v.to_string();
+        }
+        "aa_service_rev" if v.is_empty() => return Err("aa_service_rev must not be empty".into()),
+        "aa_service_rev" => cfg.api.aa_service_rev = v.to_string(),
         "zone_names" => {
             let names: Vec<String> = v.split(',').map(|n| n.trim().to_string()).collect();
             if names.len() > crate::registers::MAX_ZONES as usize {
@@ -223,7 +231,7 @@ where
         // or `#` in the value would be misparsed).
         set(&mut cfg, &k, &v).map_err(|e| format!("--{}: {e}", k.replace('_', "-")))?;
     }
-    Ok(Action::Run(cfg))
+    Ok(Action::Run(Box::new(cfg)))
 }
 
 #[cfg(test)]
@@ -238,7 +246,7 @@ mod tests {
     }
     fn run(a: &str, read: impl Fn(&Path) -> io::Result<String>) -> Result<Config, String> {
         match from_args(args(a), read)? {
-            Action::Run(c) => Ok(c),
+            Action::Run(c) => Ok(*c),
             other => panic!("{other:?}"),
         }
     }
@@ -316,6 +324,16 @@ mod tests {
         assert!(run("", bad).is_err());
         let bad = |_: &Path| Ok("sys_type = \"\"".to_string());
         assert!(run("", bad).is_err());
+        let bad = |_: &Path| Ok("my_app_rev = 12.5".to_string());
+        assert!(run("", bad).unwrap_err().contains("my_app_rev"));
+        let bad = |_: &Path| Ok("aa_service_rev = \"\"".to_string());
+        assert!(run("", bad).is_err());
+        let f = |_: &Path| Ok("my_app_rev = 15.1600\naa_service_rev = 14.120".to_string());
+        let c = run("", f).unwrap();
+        assert_eq!(
+            (c.api.my_app_rev.as_str(), c.api.aa_service_rev.as_str()),
+            ("15.1600", "14.120")
+        );
         let bad = |_: &Path| Ok("colour = blue".to_string());
         assert!(run("", bad).unwrap_err().contains("unknown key"));
     }
