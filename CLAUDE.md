@@ -124,7 +124,7 @@ Safety choices already implemented:
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
 - Milestone 3 (done): HTTP API, then official-app compatibility and the
-  tablet-side features. 116 tests passing; smoke-tested end to end (fake CB
+  tablet-side features. 121 tests passing; smoke-tested end to end (fake CB
   on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -219,7 +219,8 @@ the daemon's controller thread when `app_version` changes. Missing or
 corrupt file → defaults + warning; out-of-range values repaired on load.
 The controller runs `features::evaluate` every 30 s and on every state
 change, and timers once per second through `features::TimerClock` (each
-timer's minute runs from when it was set: every client assignment, even to
+timer's minute runs from when it was set, never counting the interval in
+which it was set: every client assignment, even to
 the same value, bumps `count_down_to_on/off_gen`; `Due` carries the
 generation and `tick_timers` only decrements a timer whose generation still
 matches under the submission lock), all through `Handle::submit` (so nothing runs in
@@ -258,7 +259,11 @@ control must not depend on the internet).
   reissued; a register changed by someone else is left alone; given up
   after 20 evaluations (~10 min). A stop (disabled / 06:00) supersedes an
   unfinished start: its outstanding writes are dropped and the restore runs
-  (`Transition::restore`). Steps must be zone-consistent (05 → zone 0; 03 →
+  (`Transition::restore`), rewriting every key the start touched so the
+  restore lands after any buffered start write. A fresh pending write is
+  waited for even if the mirror matches; client writes drop the steps for
+  the registers they write; start transitions are discarded on load unless
+  quiet night is running with saved settings. Steps must be zone-consistent (05 → zone 0; 03 →
   both payloads for the step's zone) or the transition is discarded. Climate control and MyAuto wait while a
   transition is in progress. Saved/transition payloads are range-checked
   on load (invalid ones discarded).

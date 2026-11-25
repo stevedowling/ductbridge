@@ -1246,9 +1246,7 @@ mod tests {
             app: p.app.unwrap(),
             ..st
         };
-        // Pretend the restore-like target equals the mirror: use the start's
-        // own writes but make the mirror show their targets... simpler: a
-        // fresh pending entry for a key keeps its step even if it matches.
+        // A fresh pending write for the status register...
         let t = st.app.quiet_night_transition.clone().unwrap();
         let step = &t.steps[0];
         let w = write((7, 0xabcde), step.register, step.target);
@@ -1261,7 +1259,7 @@ mod tests {
                 confirmed: false,
             },
         );
-        // Mirror shows the target for the status register.
+        // ...while the mirror already shows its target: keep waiting.
         let st = BusState {
             app: st.app.clone(),
             pending: st.pending.clone(),
