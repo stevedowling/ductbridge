@@ -43,6 +43,7 @@ src/api.rs        port-2025 JSON API: getSystemData builder, setAircon → write
 src/http.rs       std-only HTTP/1.1 server for the API (parse_request/route pure)
 src/state.rs      persisted tablet-side state (names, timers, features), atomic save
 src/features.rs   timers, climate control, MyAuto, quiet night (pure: snapshot+time → Plan)
+src/sim.rs        simulated control box (pure SimBox + SimLink) for --simulate
 src/config.rs     defaults < config file < CLI (pure; file reader injected)
 src/log.rs        levelled stderr logging; journald priorities under systemd
 src/lib.rs        module wiring + describe() for logs
@@ -124,7 +125,7 @@ Safety choices already implemented:
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
 - Milestone 3 (done): HTTP API, then official-app compatibility and the
-  tablet-side features. 121 tests passing; smoke-tested end to end (fake CB
+  tablet-side features. 127 tests passing; smoke-tested end to end (fake CB
   on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -165,7 +166,8 @@ PyPI client. Behaviour worth knowing:
 
 - `getSystemData` returns `aircons.ac1` (one unit), empty `myLights`/
   `myThings`, and a `system` block (`rid` = config `system_id`, which HA uses
-  as unique id; `sysType` "ductbridge"). It answers **503** (after waiting up
+  as unique id; `sysType` = config `sys_type`, default "MyAir5": the official
+  app says "unable to determine system type" for unknown types). It answers **503** (after waiting up
   to 3 s; the Python client does not retry non-200) until discovery is
   complete: register 05, register 01, and 03 + 04 for every zone. HA only
   creates entities (zones, motion/RSSI sensors) on its first good read. If
@@ -177,9 +179,13 @@ PyPI client. Behaviour worth knowing:
   (`system_name`, `aircon_name`, `zone_names`). ≤ 32 chars, control chars
   stripped. Zone `type` is 1 when the zone has a sensor (03 byte 2 > 0).
 - Official phone app: discovery needs `system.mid` (= `system_id`), `name`
-  and `myAppRev`; `myAppRev` is `15.0+ductbridge.<version>` (the app parses
+  and `myAppRev`; `myAppRev` (config `my_app_rev`, default "15.1548") and
+  `aaServiceRev` (`aa_service_rev`, default "14.118") match a current
+  original tablet; lower ones make the app offer an upgrade (the app parses
   the major and wants ≥ 13). Its zone objects carry `number` (must match the
-  key) and `tempSensorClash` (ignored).
+  key) and `tempSensorClash` (ignored). Every aircon needs `info.uid` (the
+  app crashes without it): the unit id as 5 lowercase hex digits, as in the
+  records; unit unknown → 503, never null or empty.
 - Wire↔JSON: mode 1 cool, 2 heat, 3 vent, 4 auto, 5 dry; fan off/low/medium/
   high/auto/autoAA (0–5); fresh air none/off/on (0–2).
 - `setAircon` accepts `{"aircons":{"ac1":…}}` and the Python client's
@@ -267,6 +273,15 @@ control must not depend on the internet).
   both payloads for the step's zone) or the transition is discarded. Climate control and MyAuto wait while a
   transition is in progress. Saved/transition payloads are range-checked
   on load (invalid ones discarded).
+
+### Simulator
+
+`ductbridge --simulate` runs the daemon (active mode) against `sim::SimLink`
+instead of the serial port: unit 07:abcde, 4 zones (1–2 with sensors),
+fresh air fitted. It answers getSystemData/flushes/writes like a CB,
+reports changes in reply to empty polls, re-reports status every 30 s
+(keeps the unit online) and drifts sensor temperatures towards the setpoint
+while cooling/heating. For trying the phone app / HA without hardware.
 
 ### Verify on install day
 

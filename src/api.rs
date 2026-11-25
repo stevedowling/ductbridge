@@ -23,6 +23,10 @@ use crate::registers::{
 };
 use crate::state::{sanitize_name, targets_valid, AppState, MAX_TIMER_MINUTES};
 
+/// Default `system.sysType`: the aircon-only tablet's type, as used by the
+/// MyPlace reference implementation (Home Assistant's fixture has "e-zone").
+pub const DEFAULT_SYS_TYPE: &str = "MyAir5";
+
 /// Names and identity reported to clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiInfo {
@@ -30,6 +34,13 @@ pub struct ApiInfo {
     /// Stable id; Home Assistant uses it as the device's unique id.
     pub system_id: String,
     pub aircon_name: String,
+    /// `system.sysType`. The official app refuses a system whose type it
+    /// does not know ("unable to determine system type").
+    pub sys_type: String,
+    /// `system.myAppRev` (checked by [`check_my_app_rev`]).
+    pub my_app_rev: String,
+    /// `system.aaServiceRev`.
+    pub aa_service_rev: String,
     /// Zone names, zone 1 first. Missing ones default to "Zone N".
     pub zone_names: Vec<String>,
 }
@@ -40,6 +51,9 @@ impl Default for ApiInfo {
             system_name: "ductbridge".into(),
             system_id: "ductbridge".into(),
             aircon_name: "Aircon".into(),
+            sys_type: DEFAULT_SYS_TYPE.into(),
+            my_app_rev: DEFAULT_MY_APP_REV.into(),
+            aa_service_rev: DEFAULT_AA_SERVICE_REV.into(),
             zone_names: Vec::new(),
         }
     }
@@ -71,10 +85,27 @@ impl ApiInfo {
     }
 }
 
-/// App revision reported to clients. The official app reads the number
-/// before the first `.` and only stores the system's `rid` when it is ≥ 13.
-pub fn my_app_rev() -> String {
-    format!("15.0+ductbridge.{}", env!("CARGO_PKG_VERSION"))
+/// Default `system.myAppRev` and `system.aaServiceRev`: what a current
+/// original tablet reports (observed). A lower revision makes the official
+/// app offer a tablet upgrade. The app reads the number before the first
+/// `.` and only stores the system's `rid` when it is ≥ 13.
+pub const DEFAULT_MY_APP_REV: &str = "15.1548";
+pub const DEFAULT_AA_SERVICE_REV: &str = "14.118";
+
+/// Check a configured `myAppRev`: `major.build`, major ≥ 13.
+pub fn check_my_app_rev(v: &str) -> Result<(), String> {
+    let ok = v.split_once('.').is_some_and(|(major, build)| {
+        major.parse::<u32>().is_ok_and(|m| m >= 13)
+            && !build.is_empty()
+            && build.bytes().all(|b| b.is_ascii_digit())
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "my_app_rev {v:?} (expected major.build, major ≥ 13, e.g. {DEFAULT_MY_APP_REV:?})"
+        ))
+    }
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -256,6 +287,10 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
             "ac1": {
                 "info": {
                     "name": info.aircon_name(app),
+                    // The official app crashes without it. Same characters
+                    // as the unit id in the register records; view() only
+                    // succeeds once the unit is known, so never empty.
+                    "uid": format!("{:05x}", v.unit.1),
                     "state": if s.on { "on" } else { "off" },
                     // MyAuto is a tablet-side mode; the box sees cool/heat.
                     "mode": if app.my_auto_enabled && app.my_auto_selected {
@@ -296,8 +331,9 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
             "rid": info.system_id,
             // The official app ignores a reply without mid, name and myAppRev.
             "mid": info.system_id,
-            "sysType": "ductbridge",
-            "myAppRev": my_app_rev(),
+            "sysType": info.sys_type,
+            "myAppRev": info.my_app_rev,
+            "aaServiceRev": info.aa_service_rev,
             "needsUpdate": false,
             "noOfAircons": 1,
             "hasAircons": true,
@@ -812,7 +848,7 @@ mod tests {
         assert_eq!(z2["motionConfig"], 2);
         assert_eq!(z2["rssi"], 0x50);
         assert_eq!(d["system"]["rid"], "ductbridge");
-        assert_eq!(d["system"]["sysType"], "ductbridge");
+        assert_eq!(d["system"]["sysType"], "MyAir5");
         assert!(d["myLights"]["lights"].as_object().unwrap().is_empty());
     }
 
@@ -822,10 +858,16 @@ mod tests {
             system_name: "Home".into(),
             system_id: "id1".into(),
             aircon_name: "Ducted".into(),
+            sys_type: "e-zone".into(),
+            my_app_rev: "15.2000".into(),
+            aa_service_rev: "14.200".into(),
             zone_names: vec!["Living".into(), String::new()],
         };
         let d = sd(&state(), &info).unwrap();
         assert_eq!(d["system"]["name"], "Home");
+        assert_eq!(d["system"]["sysType"], "e-zone");
+        assert_eq!(d["system"]["myAppRev"], "15.2000");
+        assert_eq!(d["system"]["aaServiceRev"], "14.200");
         assert_eq!(d["aircons"]["ac1"]["info"]["name"], "Ducted");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z01"]["name"], "Living");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z02"]["name"], "Zone 2");
@@ -1052,7 +1094,64 @@ mod tests {
         let rev = sys["myAppRev"].as_str().unwrap();
         let major: u32 = rev.split('.').next().unwrap().parse().unwrap();
         assert_eq!(major, 15);
-        assert!(rev.ends_with(env!("CARGO_PKG_VERSION")), "{rev}");
+        // Current tablet revisions: no "upgrade available" prompt.
+        assert_eq!(rev, "15.1548");
+        assert_eq!(sys["aaServiceRev"], "14.118");
+    }
+
+    #[test]
+    fn my_app_rev_is_checked() {
+        assert!(check_my_app_rev(DEFAULT_MY_APP_REV).is_ok());
+        assert!(check_my_app_rev("13.0").is_ok());
+        for bad in [
+            "",
+            "15",
+            "12.999",
+            "x.1",
+            "15.",
+            "15.1a",
+            "15.0+ductbridge.0.1.0",
+        ] {
+            assert!(check_my_app_rev(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    fn uids(d: &Value) -> Vec<String> {
+        let acs = d["aircons"].as_object().expect("aircons object");
+        assert!(!acs.is_empty());
+        acs.iter()
+            .map(|(k, ac)| {
+                let uid = ac["info"]["uid"].as_str();
+                let uid = uid.unwrap_or_else(|| panic!("{k}.info.uid missing or not a string"));
+                assert!(
+                    uid.len() == 5
+                        && uid
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "{k}.info.uid {uid:?} is not 5 lowercase hex digits"
+                );
+                uid.to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_aircon_has_a_five_hex_digit_uid() {
+        // The official app crashes ("Uid null") without info.uid.
+        assert_eq!(uids(&sd(&state(), &ApiInfo::default()).unwrap()), ["abcde"]);
+        // Small ids are zero-padded, matching the record's characters 4–8.
+        let t = Instant::now();
+        let st = fed(
+            t,
+            "0703000a10120010100000000 0703000a10501010330000100 0703000a10301e40030000000 0703000a10401006400000000",
+        );
+        assert_eq!(
+            uids(&system_data(&st, &ApiInfo::default(), t).unwrap()),
+            ["000a1"]
+        );
+        // Unit not known yet: 503, never a missing or empty uid.
+        let (_b, h) = Bridge::new(TxMode::ListenOnly, t);
+        assert!(system_data(&h.snapshot(), &ApiInfo::default(), t).is_err());
     }
 
     #[test]

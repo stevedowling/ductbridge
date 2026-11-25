@@ -12,6 +12,9 @@
 //! system_name = "Home"     # names shown by apps (not stored on the bus)
 //! system_id = "ductbridge" # stable id; Home Assistant's unique id
 //! aircon_name = "Aircon"
+//! sys_type = "MyAir5"     # system type reported to apps
+//! my_app_rev = "15.1548"  # tablet app revision reported to apps
+//! aa_service_rev = "14.118"
 //! zone_names = "Living, Kitchen, Bed 1"   # zone 1 first, comma-separated
 //! ```
 
@@ -36,6 +39,7 @@ Options:
       --state-file PATH  tablet-side state (default /var/lib/ductbridge/state.json)
       --listen-only      never transmit (default)
       --active           answer the control box's Pings (replaces the tablet)
+      --simulate         use a simulated control box instead of the serial port
       --log-level LEVEL  error, warn, info or debug (default info)
   -h, --help             show this help
   -V, --version          show the version
@@ -52,6 +56,9 @@ pub struct Config {
     /// Persisted tablet-side state (names, timers, features); "off" keeps
     /// it in memory only.
     pub state_file: String,
+    /// Talk to a simulated control box instead of the serial port (implies
+    /// active mode; never touches the bus).
+    pub simulate: bool,
 }
 
 impl Default for Config {
@@ -63,6 +70,7 @@ impl Default for Config {
             log_level: Level::Info,
             api: ApiInfo::default(),
             state_file: "/var/lib/ductbridge/state.json".into(),
+            simulate: false,
         }
     }
 }
@@ -70,7 +78,7 @@ impl Default for Config {
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    Run(Config),
+    Run(Box<Config>),
     Help,
     Version,
 }
@@ -130,10 +138,25 @@ fn set(cfg: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "port" => cfg.port = v.to_string(),
         "http_bind" => cfg.http_bind = v.to_string(),
         "state_file" => cfg.state_file = v.to_string(),
+        "simulate" => {
+            cfg.simulate = match v {
+                "true" => true,
+                "false" => false,
+                _ => return Err(format!("simulate {v:?} (true or false)")),
+            }
+        }
         "system_name" => cfg.api.system_name = v.to_string(),
         "system_id" if v.is_empty() => return Err("system_id must not be empty".into()),
         "system_id" => cfg.api.system_id = v.to_string(),
         "aircon_name" => cfg.api.aircon_name = v.to_string(),
+        "sys_type" if v.is_empty() => return Err("sys_type must not be empty".into()),
+        "sys_type" => cfg.api.sys_type = v.to_string(),
+        "my_app_rev" => {
+            crate::api::check_my_app_rev(v)?;
+            cfg.api.my_app_rev = v.to_string();
+        }
+        "aa_service_rev" if v.is_empty() => return Err("aa_service_rev must not be empty".into()),
+        "aa_service_rev" => cfg.api.aa_service_rev = v.to_string(),
         "zone_names" => {
             let names: Vec<String> = v.split(',').map(|n| n.trim().to_string()).collect();
             if names.len() > crate::registers::MAX_ZONES as usize {
@@ -170,7 +193,7 @@ where
                 .ok_or_else(|| format!("{name} needs a value"))
         };
         match flag.as_str() {
-            "-h" | "--help" | "-V" | "--version" | "--listen-only" | "--active"
+            "-h" | "--help" | "-V" | "--version" | "--listen-only" | "--active" | "--simulate"
                 if inline.is_some() =>
             {
                 return Err(format!("{flag} takes no value"))
@@ -184,6 +207,7 @@ where
             "--log-level" => overrides.push(("log_level".into(), value(&flag)?)),
             "--listen-only" => overrides.push(("mode".into(), "listen-only".into())),
             "--active" => overrides.push(("mode".into(), "active".into())),
+            "--simulate" => overrides.push(("simulate".into(), "true".into())),
             _ => return Err(format!("unknown argument {a:?}\n\n{USAGE}")),
         }
     }
@@ -207,7 +231,7 @@ where
         // or `#` in the value would be misparsed).
         set(&mut cfg, &k, &v).map_err(|e| format!("--{}: {e}", k.replace('_', "-")))?;
     }
-    Ok(Action::Run(cfg))
+    Ok(Action::Run(Box::new(cfg)))
 }
 
 #[cfg(test)]
@@ -222,7 +246,7 @@ mod tests {
     }
     fn run(a: &str, read: impl Fn(&Path) -> io::Result<String>) -> Result<Config, String> {
         match from_args(args(a), read)? {
-            Action::Run(c) => Ok(c),
+            Action::Run(c) => Ok(*c),
             other => panic!("{other:?}"),
         }
     }
@@ -236,6 +260,9 @@ mod tests {
         assert_eq!(c.state_file, "/var/lib/ductbridge/state.json");
         let c = run("--state-file /tmp/s.json", no_file).unwrap();
         assert_eq!(c.state_file, "/tmp/s.json");
+        assert!(!c.simulate);
+        assert!(run("--simulate", no_file).unwrap().simulate);
+        assert!(run("--simulate=yes", no_file).is_err());
     }
 
     #[test]
@@ -257,6 +284,9 @@ mod tests {
         assert_eq!(c.api.system_name, "Home");
         assert_eq!(c.api.zone_names, ["Living", "Bed 1", "", "Study"]);
         assert_eq!(c.api.system_id, "ductbridge");
+        assert_eq!(c.api.sys_type, "MyAir5");
+        let f = |_: &Path| Ok("sys_type = \"e-zone\"".to_string());
+        assert_eq!(run("", f).unwrap().api.sys_type, "e-zone");
 
         let c = run("--config=/x.conf --listen-only --port /dev/ttyUSB1", file).unwrap();
         assert_eq!(c.mode, TxMode::ListenOnly);
@@ -292,6 +322,18 @@ mod tests {
         assert!(run("", bad).unwrap_err().contains("more than 10"));
         let bad = |_: &Path| Ok("system_id = \"\"".to_string());
         assert!(run("", bad).is_err());
+        let bad = |_: &Path| Ok("sys_type = \"\"".to_string());
+        assert!(run("", bad).is_err());
+        let bad = |_: &Path| Ok("my_app_rev = 12.5".to_string());
+        assert!(run("", bad).unwrap_err().contains("my_app_rev"));
+        let bad = |_: &Path| Ok("aa_service_rev = \"\"".to_string());
+        assert!(run("", bad).is_err());
+        let f = |_: &Path| Ok("my_app_rev = 15.1600\naa_service_rev = 14.120".to_string());
+        let c = run("", f).unwrap();
+        assert_eq!(
+            (c.api.my_app_rev.as_str(), c.api.aa_service_rev.as_str()),
+            ("15.1600", "14.120")
+        );
         let bad = |_: &Path| Ok("colour = blue".to_string());
         assert!(run("", bad).unwrap_err().contains("unknown key"));
     }

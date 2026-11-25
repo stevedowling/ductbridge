@@ -161,19 +161,32 @@ fn main() -> ExitCode {
         }
     };
     log::init(cfg.log_level);
-    log_info!(
-        "ductbridge {} starting: port {}, mode {:?}",
-        env!("CARGO_PKG_VERSION"),
-        cfg.port,
-        cfg.mode
-    );
-    match cfg.mode {
-        TxMode::ListenOnly => log_info!("listen-only: will never transmit"),
-        TxMode::Active => log_warn!(
-            "active mode: answering control-box Pings; the original tablet must be unplugged"
-        ),
+    if cfg.simulate {
+        log_info!(
+            "ductbridge {} starting: simulated control box, mode Active",
+            env!("CARGO_PKG_VERSION")
+        );
+    } else {
+        log_info!(
+            "ductbridge {} starting: port {}, mode {:?}",
+            env!("CARGO_PKG_VERSION"),
+            cfg.port,
+            cfg.mode
+        );
     }
-    let (mut bridge, handle) = Bridge::new(cfg.mode, Instant::now());
+    let mode = if cfg.simulate {
+        log_warn!("SIMULATION: talking to a simulated control box; the serial port is not used");
+        TxMode::Active
+    } else {
+        match cfg.mode {
+            TxMode::ListenOnly => log_info!("listen-only: will never transmit"),
+            TxMode::Active => log_warn!(
+                "active mode: answering control-box Pings; the original tablet must be unplugged"
+            ),
+        }
+        cfg.mode
+    };
+    let (mut bridge, handle) = Bridge::new(mode, Instant::now());
     let state_file = (cfg.state_file != "off").then(|| PathBuf::from(&cfg.state_file));
     match &state_file {
         Some(path) => {
@@ -203,6 +216,14 @@ fn main() -> ExitCode {
         log_info!("HTTP API listening on {}", cfg.http_bind);
         let info = cfg.api.clone();
         std::thread::spawn(move || http::serve(listener, handle, info));
+    }
+    if cfg.simulate {
+        let mut link = ductbridge::sim::SimLink::new();
+        match run(&mut link, &mut bridge) {
+            Ok(()) => log_error!("simulated control box stopped"),
+            Err(e) => log_error!("simulated control box: {e}"),
+        }
+        return ExitCode::FAILURE;
     }
     let mut first = true;
     loop {
