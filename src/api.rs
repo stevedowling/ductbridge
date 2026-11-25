@@ -450,6 +450,19 @@ pub fn set_aircon(query: &str, st: &BusState, now: Instant) -> Result<Plan, Stri
             }
         }
     }
+    // A client write to a register quiet night is still changing wins: drop
+    // those steps so a retry can never undo the user's value.
+    if let Some(t) = app.quiet_night_transition.as_mut() {
+        t.steps.retain(|s| {
+            !plan
+                .writes
+                .iter()
+                .any(|w| w.register == s.register && crate::session::key_of(w).3 == s.zone)
+        });
+        if t.steps.is_empty() {
+            app.quiet_night_transition = None;
+        }
+    }
     if app != st.app {
         plan.app = Some(app);
     }
@@ -1167,6 +1180,45 @@ mod tests {
             .app
             .unwrap();
         assert!(app.my_auto_enabled && app.my_auto_selected);
+    }
+
+    #[test]
+    fn client_writes_drop_quiet_night_steps_for_those_registers() {
+        use crate::state::{Step, Transition};
+        let mut st = state();
+        st.app.quiet_night_transition = Some(Transition {
+            steps: vec![
+                Step {
+                    register: 3,
+                    zone: 2,
+                    target: [2, 0x32, 0, 32, 0, 0, 0],
+                    from: [2, 0x32, 1, 48, 21, 3, 0],
+                },
+                Step {
+                    register: 5,
+                    zone: 0,
+                    target: [1, 3, 3, 32, 0, 1, 0],
+                    from: [1, 1, 3, 48, 0, 1, 0],
+                },
+            ],
+            attempts: 1,
+            restore: false,
+        });
+        // The user sets zone 2 back to 24 °C: quiet night must not retry 16 °C.
+        let app = plan(r#"{"ac1":{"zones":{"z02":{"setTemp":24}}}}"#, &st)
+            .app
+            .unwrap();
+        let steps = app.quiet_night_transition.unwrap().steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].register, 5);
+        // A status write drops the last step: transition gone.
+        st.app.quiet_night_transition = Some(Transition {
+            steps,
+            attempts: 1,
+            restore: false,
+        });
+        let app = plan(r#"{"ac1":{"info":{"fan":"low"}}}"#, &st).app.unwrap();
+        assert!(app.quiet_night_transition.is_none());
     }
 
     #[test]

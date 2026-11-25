@@ -221,6 +221,17 @@ impl AppState {
             fixed.push("quiet night marked running without saved settings; cleared".into());
             self.quiet_night_running = false;
         }
+        // A start transition only makes sense while quiet night is running
+        // with settings to restore later.
+        if self
+            .quiet_night_transition
+            .as_ref()
+            .is_some_and(|t| !t.restore)
+            && !(self.quiet_night_running && self.quiet_night_saved.is_some())
+        {
+            fixed.push("quiet night start transition without running state; discarded".into());
+            self.quiet_night_transition = None;
+        }
         fixed
     }
 
@@ -378,6 +389,24 @@ mod tests {
         )
         .unwrap();
         assert!(s.quiet_night_running && fixed.is_empty(), "{fixed:?}");
+    }
+
+    #[test]
+    fn start_transition_without_running_state_is_discarded() {
+        let (s, fixed) = AppState::from_json(
+            r#"{"quietNightRunning": false,
+                "quietNightTransition": {"steps": [{"register": 5, "zone": 0,
+                    "target": [1,3,3,32,0,1,0], "from": [1,1,3,48,0,1,0]}], "attempts": 0}}"#,
+        )
+        .unwrap();
+        assert!(s.quiet_night_transition.is_none(), "{fixed:?}");
+        // A restore transition is kept without running state.
+        let (s, _) = AppState::from_json(
+            r#"{"quietNightTransition": {"steps": [{"register": 5, "zone": 0,
+                "target": [1,1,3,48,0,1,0], "from": [1,3,3,32,0,1,0]}], "attempts": 0, "restore": true}}"#,
+        )
+        .unwrap();
+        assert!(s.quiet_night_transition.is_some());
     }
 
     #[test]

@@ -144,19 +144,24 @@ pub fn evaluate(st: &BusState, now: Instant, minute: Option<u16>) -> Plan {
     // start: drop its outstanding writes and restore instead.
     let stop = app.quiet_night_running
         && (!app.quiet_night_enabled || minute.map(in_quiet_window) == Some(false));
+    let mut force = Vec::new();
     if stop
         && app
             .quiet_night_transition
             .as_ref()
             .is_some_and(|t| !t.restore)
     {
-        app.quiet_night_transition = None;
+        // Its writes may still be queued or in flight: restore every key it
+        // touched, even where the mirror already shows the saved value, so
+        // the restore is ordered after them on the bus.
+        let t = app.quiet_night_transition.take().expect("checked");
+        force = t.steps.iter().map(|s| (s.register, s.zone)).collect();
         plan.writes.clear();
         plan.log
             .push("quiet night: stopping before its start completed".into());
     }
     if app.quiet_night_transition.is_none() {
-        quiet_night(&v, &mut app, minute, &mut plan);
+        quiet_night(&v, &mut app, minute, &force, &mut plan);
     }
     // While quiet night is starting or ending, the other features wait:
     // they would build on the values being replaced.
@@ -210,11 +215,15 @@ fn advance_transition(v: &View, app: &mut AppState, plan: &mut Plan) {
         let Some(read) = v.st.registers.get(&key).map(|r| r.payload) else {
             continue;
         };
-        if shows(step.register, &read, &step.target) {
-            continue; // done
-        }
-        if v.st.pending.contains_key(&key) {
+        // A fresh pending write means the mirror may not show it yet, even
+        // where it already matches (e.g. a restore to unchanged values).
+        let pending = v.st.pending.get(&key).is_some_and(|p| {
+            v.now.saturating_duration_since(p.accepted) < crate::bridge::PENDING_TTL
+        });
+        if pending {
             left.push(step); // still on its way
+        } else if shows(step.register, &read, &step.target) {
+            // done
         } else if shows(step.register, &read, &step.from) {
             plan.writes.push(step_write(v, &step)); // dropped: reissue
             left.push(step);
@@ -249,7 +258,15 @@ fn transition_write(v: &View, steps: &mut Vec<Step>, plan: &mut Plan, step: Step
     steps.push(step);
 }
 
-fn quiet_night(v: &View, app: &mut AppState, minute: Option<u16>, plan: &mut Plan) {
+/// `force`: registers (register, zone) to restore even if they already show
+/// the saved value (outstanding writes of a superseded start).
+fn quiet_night(
+    v: &View,
+    app: &mut AppState,
+    minute: Option<u16>,
+    force: &[(u8, u8)],
+    plan: &mut Plan,
+) {
     let Some(p) = desired_status(v) else { return };
     // Unknown time: neither in nor out of the window.
     let in_window = minute.map(in_quiet_window);
@@ -260,7 +277,7 @@ fn quiet_night(v: &View, app: &mut AppState, minute: Option<u16>, plan: &mut Pla
         if let Some(saved) = app.quiet_night_saved.take() {
             let mut s = p;
             s[1..6].copy_from_slice(&saved.status[1..6]);
-            if s != p {
+            if s != p || force.contains(&(SystemStatus::REG, 0)) {
                 let step = Step {
                     register: SystemStatus::REG,
                     zone: 0,
@@ -271,7 +288,8 @@ fn quiet_night(v: &View, app: &mut AppState, minute: Option<u16>, plan: &mut Pla
             }
             for z in zones(v) {
                 if let Some((_, sp)) = saved.zones.iter().find(|(n, _)| *n == z.n) {
-                    if sp[1] != z.p[1] || sp[3] != z.p[3] {
+                    if sp[1] != z.p[1] || sp[3] != z.p[3] || force.contains(&(ZoneState::REG, z.n))
+                    {
                         let target = [z.n, sp[1], 0, sp[3], 0, 0, 0];
                         let step = Step {
                             register: ZoneState::REG,
@@ -484,8 +502,11 @@ impl TimerClock {
                 continue;
             }
             if self.gen[i] != Some(gen) {
+                // Newly (re-)armed during this interval: count from now, so
+                // time before the assignment never counts.
                 self.gen[i] = Some(gen);
                 self.elapsed[i] = 0;
+                continue;
             }
             // Capped: a minute that ends while the bus is not ready counts
             // once, as soon as it is ready again.
@@ -633,10 +654,12 @@ mod tests {
         // 59 s pass with no timer; then a 1-minute timer is set.
         assert_eq!(clock.advance(&app, 59), Due::default());
         set_off(&mut app, 1);
-        assert_eq!(clock.advance(&app, 1).off, None, "1 s after setting");
-        assert_eq!(clock.advance(&app, 58).off, None);
+        // The interval in which it was set does not count (it may have been
+        // set at any point in it).
+        assert_eq!(clock.advance(&app, 1).off, None, "seen being set");
+        assert_eq!(clock.advance(&app, 59).off, None, "59 s counted");
         let due = clock.advance(&app, 1);
-        assert_eq!(due.off, Some(1), "60 s after setting: due");
+        assert_eq!(due.off, Some(1), "60 s counted: due");
         // After the tick (value now 0) nothing is due.
         app.count_down_to_off = 0;
         clock.ticked(due);
@@ -648,9 +671,11 @@ mod tests {
         let mut clock = TimerClock::default();
         let mut app = AppState::default();
         set_off(&mut app, 1);
+        clock.advance(&app, 0);
         assert!(!clock.advance(&app, 50).any());
         // Set to 1 again after 50 s: the value is unchanged, the minute is not.
         set_off(&mut app, 1);
+        clock.advance(&app, 0);
         assert!(
             !clock.advance(&app, 10).any(),
             "would fire 10 s after re-arming"
@@ -666,6 +691,7 @@ mod tests {
             count_down_to_off: 2,
             ..AppState::default()
         };
+        clock.advance(&app, 0);
         assert_eq!(clock.advance(&app, 60), BOTH);
         app.count_down_to_on = 2; // as tick_timers would (same generation)
         app.count_down_to_off = 1;
@@ -683,6 +709,7 @@ mod tests {
         let mut clock = TimerClock::default();
         let mut app = AppState::default();
         set_off(&mut app, 2);
+        clock.advance(&app, 0);
         let due = clock.advance(&app, 60);
         assert_eq!(due.off, Some(1));
         // Before the tick takes the lock, a client sets it to 1 (new gen).
@@ -692,6 +719,7 @@ mod tests {
         assert!(p.writes.is_empty() && p.app.is_none(), "not fired early");
         clock.ticked(due);
         // The re-armed timer runs its own full minute.
+        clock.advance(&app, 0);
         assert!(!clock.advance(&app, 59).any());
         assert_eq!(clock.advance(&app, 1).off, Some(2));
     }
@@ -1181,6 +1209,76 @@ mod tests {
             .iter()
             .all(|r| r.payload[1] != MODE_VENT || r.register != SystemStatus::REG));
         assert!(!p.app.unwrap().quiet_night_running);
+    }
+
+    #[test]
+    fn time_before_a_re_arm_never_counts() {
+        // The controller stalled for 60 s; the timer was re-armed near the
+        // end of that gap. The new generation is not due straight away.
+        let mut clock = TimerClock::default();
+        let mut app = AppState::default();
+        set_off(&mut app, 1);
+        clock.advance(&app, 0);
+        set_off(&mut app, 1);
+        assert!(!clock.advance(&app, 60).any());
+    }
+
+    #[test]
+    fn stopping_restores_every_key_a_superseded_start_touched() {
+        // Start accepted, pending entries since expired, mirror unchanged
+        // (writes still buffered, e.g. across a reconnect). Then 06:00.
+        let st = bus(&s(true, MODE_COOL, 23.0, 0), &quiet_zones(), quiet());
+        let app = evaluate(&st, Instant::now(), Some(23 * 60)).app.unwrap();
+        let st = BusState { app, ..st };
+        let p = evaluate(&st, Instant::now(), Some(QUIET_END));
+        // The mirror already shows the saved values, yet every key is
+        // rewritten so the restore lands after the buffered start writes.
+        assert_eq!(status_write(&p).unwrap()[1], MODE_COOL);
+        assert_eq!(zone_writes(&p).len(), 2);
+        assert!(p.app.unwrap().quiet_night_transition.unwrap().restore);
+    }
+
+    #[test]
+    fn a_fresh_pending_write_is_waited_for_even_if_the_mirror_matches() {
+        let st = bus(&s(true, MODE_COOL, 23.0, 0), &quiet_zones(), quiet());
+        let p = evaluate(&st, Instant::now(), Some(23 * 60));
+        let mut st = BusState {
+            app: p.app.unwrap(),
+            ..st
+        };
+        // Pretend the restore-like target equals the mirror: use the start's
+        // own writes but make the mirror show their targets... simpler: a
+        // fresh pending entry for a key keeps its step even if it matches.
+        let t = st.app.quiet_night_transition.clone().unwrap();
+        let step = &t.steps[0];
+        let w = write((7, 0xabcde), step.register, step.target);
+        st.pending.insert(
+            crate::session::key_of(&w),
+            crate::bridge::Pending {
+                record: w,
+                seq: 1,
+                accepted: Instant::now(),
+                confirmed: false,
+            },
+        );
+        // Mirror shows the target for the status register.
+        let st = BusState {
+            app: st.app.clone(),
+            pending: st.pending.clone(),
+            ..bus(&s(true, MODE_VENT, 16.0, 0), &night_zones(), quiet())
+        };
+        let p = evaluate(&st, Instant::now(), Some(23 * 60 + 1));
+        let left = p
+            .app
+            .map(|a| a.quiet_night_transition)
+            .unwrap_or(st.app.quiet_night_transition.clone());
+        assert!(
+            left.unwrap()
+                .steps
+                .iter()
+                .any(|s| s.register == SystemStatus::REG),
+            "still waiting"
+        );
     }
 
     #[test]
