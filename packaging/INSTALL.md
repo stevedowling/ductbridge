@@ -6,6 +6,34 @@ Ethernet, USB-RS485 adapter (FTDI or CH340).
 > Nothing here has been tested against a real control box yet. Keep the
 > original tablet so you can plug it back in.
 
+## 0. Try it without the hardware (optional)
+
+`--simulate` runs ductbridge against a simulated control box (four zones,
+two with temperature sensors) instead of the serial port. Use it to try
+the phone app and Home Assistant before install day. It never touches the
+bus, so the adapter doesn't need to be plugged in.
+
+On the Pi (or any 64-bit Linux machine on your network), with the service
+stopped so port 2025 is free:
+
+```bash
+sudo systemctl stop ductbridge
+```
+
+```bash
+ductbridge --simulate --state-file /tmp/ductbridge-sim.json --log-level debug
+```
+
+Then open the MyPlace app on a phone on the same network: it should find a
+system called "ductbridge". Changes you make (on/off, mode, fan, zones,
+names, timers, MyAuto, climate control) go to the simulated box and come
+back as they would from a real one; zone temperatures drift towards their
+setpoints while the unit runs. Stop with Ctrl-C. The `--state-file` keeps
+the simulation's names and settings out of the real state file.
+
+If the app does not find the system or something misbehaves, send the
+terminal output (debug level logs every HTTP request).
+
 ## 1. Wiring
 
 Check the pins with a multimeter first. The cable carries ~14 V DC on pin 5.

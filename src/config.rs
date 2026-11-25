@@ -36,6 +36,7 @@ Options:
       --state-file PATH  tablet-side state (default /var/lib/ductbridge/state.json)
       --listen-only      never transmit (default)
       --active           answer the control box's Pings (replaces the tablet)
+      --simulate         use a simulated control box instead of the serial port
       --log-level LEVEL  error, warn, info or debug (default info)
   -h, --help             show this help
   -V, --version          show the version
@@ -52,6 +53,9 @@ pub struct Config {
     /// Persisted tablet-side state (names, timers, features); "off" keeps
     /// it in memory only.
     pub state_file: String,
+    /// Talk to a simulated control box instead of the serial port (implies
+    /// active mode; never touches the bus).
+    pub simulate: bool,
 }
 
 impl Default for Config {
@@ -63,6 +67,7 @@ impl Default for Config {
             log_level: Level::Info,
             api: ApiInfo::default(),
             state_file: "/var/lib/ductbridge/state.json".into(),
+            simulate: false,
         }
     }
 }
@@ -130,6 +135,13 @@ fn set(cfg: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "port" => cfg.port = v.to_string(),
         "http_bind" => cfg.http_bind = v.to_string(),
         "state_file" => cfg.state_file = v.to_string(),
+        "simulate" => {
+            cfg.simulate = match v {
+                "true" => true,
+                "false" => false,
+                _ => return Err(format!("simulate {v:?} (true or false)")),
+            }
+        }
         "system_name" => cfg.api.system_name = v.to_string(),
         "system_id" if v.is_empty() => return Err("system_id must not be empty".into()),
         "system_id" => cfg.api.system_id = v.to_string(),
@@ -170,7 +182,7 @@ where
                 .ok_or_else(|| format!("{name} needs a value"))
         };
         match flag.as_str() {
-            "-h" | "--help" | "-V" | "--version" | "--listen-only" | "--active"
+            "-h" | "--help" | "-V" | "--version" | "--listen-only" | "--active" | "--simulate"
                 if inline.is_some() =>
             {
                 return Err(format!("{flag} takes no value"))
@@ -184,6 +196,7 @@ where
             "--log-level" => overrides.push(("log_level".into(), value(&flag)?)),
             "--listen-only" => overrides.push(("mode".into(), "listen-only".into())),
             "--active" => overrides.push(("mode".into(), "active".into())),
+            "--simulate" => overrides.push(("simulate".into(), "true".into())),
             _ => return Err(format!("unknown argument {a:?}\n\n{USAGE}")),
         }
     }
@@ -236,6 +249,9 @@ mod tests {
         assert_eq!(c.state_file, "/var/lib/ductbridge/state.json");
         let c = run("--state-file /tmp/s.json", no_file).unwrap();
         assert_eq!(c.state_file, "/tmp/s.json");
+        assert!(!c.simulate);
+        assert!(run("--simulate", no_file).unwrap().simulate);
+        assert!(run("--simulate=yes", no_file).is_err());
     }
 
     #[test]

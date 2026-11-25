@@ -21,6 +21,7 @@ pub mod log;
 pub mod record;
 pub mod registers;
 pub mod session;
+pub mod sim;
 pub mod state;
 
 /// Human-readable one-line description of a record, for logs and the monitor.

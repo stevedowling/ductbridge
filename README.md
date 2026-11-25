@@ -54,6 +54,7 @@ cargo test
 cargo run --bin ductbridge-monitor -- /dev/ttyUSB0   # live bus, listen-only
 cargo run --bin ductbridge-monitor -- capture.bin    # replay a raw capture
 cargo run --bin ductbridge -- --help                 # bus daemon
+cargo run --bin ductbridge -- --simulate --http-bind 127.0.0.1:2025 --state-file off   # no hardware
 ```
 
 Installing on a Pi as a systemd service: [packaging/INSTALL.md](packaging/INSTALL.md).

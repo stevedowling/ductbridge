@@ -43,6 +43,7 @@ src/api.rs        port-2025 JSON API: getSystemData builder, setAircon → write
 src/http.rs       std-only HTTP/1.1 server for the API (parse_request/route pure)
 src/state.rs      persisted tablet-side state (names, timers, features), atomic save
 src/features.rs   timers, climate control, MyAuto, quiet night (pure: snapshot+time → Plan)
+src/sim.rs        simulated control box (pure SimBox + SimLink) for --simulate
 src/config.rs     defaults < config file < CLI (pure; file reader injected)
 src/log.rs        levelled stderr logging; journald priorities under systemd
 src/lib.rs        module wiring + describe() for logs
@@ -124,7 +125,7 @@ Safety choices already implemented:
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
 - Milestone 3 (done): HTTP API, then official-app compatibility and the
-  tablet-side features. 121 tests passing; smoke-tested end to end (fake CB
+  tablet-side features. 124 tests passing; smoke-tested end to end (fake CB
   on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -267,6 +268,15 @@ control must not depend on the internet).
   both payloads for the step's zone) or the transition is discarded. Climate control and MyAuto wait while a
   transition is in progress. Saved/transition payloads are range-checked
   on load (invalid ones discarded).
+
+### Simulator
+
+`ductbridge --simulate` runs the daemon (active mode) against `sim::SimLink`
+instead of the serial port: unit 07:abcde, 4 zones (1–2 with sensors),
+fresh air fitted. It answers getSystemData/flushes/writes like a CB,
+reports changes in reply to empty polls, re-reports status every 30 s
+(keeps the unit online) and drifts sensor temperatures towards the setpoint
+while cooling/heating. For trying the phone app / HA without hardware.
 
 ### Verify on install day
 
