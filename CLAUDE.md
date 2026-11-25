@@ -166,7 +166,8 @@ PyPI client. Behaviour worth knowing:
 
 - `getSystemData` returns `aircons.ac1` (one unit), empty `myLights`/
   `myThings`, and a `system` block (`rid` = config `system_id`, which HA uses
-  as unique id; `sysType` "ductbridge"). It answers **503** (after waiting up
+  as unique id; `sysType` = config `sys_type`, default "MyAir5": the official
+  app says "unable to determine system type" for unknown types). It answers **503** (after waiting up
   to 3 s; the Python client does not retry non-200) until discovery is
   complete: register 05, register 01, and 03 + 04 for every zone. HA only
   creates entities (zones, motion/RSSI sensors) on its first good read. If

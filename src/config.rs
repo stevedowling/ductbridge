@@ -12,6 +12,7 @@
 //! system_name = "Home"     # names shown by apps (not stored on the bus)
 //! system_id = "ductbridge" # stable id; Home Assistant's unique id
 //! aircon_name = "Aircon"
+//! sys_type = "MyAir5"     # system type reported to apps
 //! zone_names = "Living, Kitchen, Bed 1"   # zone 1 first, comma-separated
 //! ```
 
@@ -146,6 +147,8 @@ fn set(cfg: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "system_id" if v.is_empty() => return Err("system_id must not be empty".into()),
         "system_id" => cfg.api.system_id = v.to_string(),
         "aircon_name" => cfg.api.aircon_name = v.to_string(),
+        "sys_type" if v.is_empty() => return Err("sys_type must not be empty".into()),
+        "sys_type" => cfg.api.sys_type = v.to_string(),
         "zone_names" => {
             let names: Vec<String> = v.split(',').map(|n| n.trim().to_string()).collect();
             if names.len() > crate::registers::MAX_ZONES as usize {
@@ -273,6 +276,9 @@ mod tests {
         assert_eq!(c.api.system_name, "Home");
         assert_eq!(c.api.zone_names, ["Living", "Bed 1", "", "Study"]);
         assert_eq!(c.api.system_id, "ductbridge");
+        assert_eq!(c.api.sys_type, "MyAir5");
+        let f = |_: &Path| Ok("sys_type = \"e-zone\"".to_string());
+        assert_eq!(run("", f).unwrap().api.sys_type, "e-zone");
 
         let c = run("--config=/x.conf --listen-only --port /dev/ttyUSB1", file).unwrap();
         assert_eq!(c.mode, TxMode::ListenOnly);
@@ -307,6 +313,8 @@ mod tests {
         let bad = |_: &Path| Ok("zone_names = a,b,c,d,e,f,g,h,i,j,k".to_string());
         assert!(run("", bad).unwrap_err().contains("more than 10"));
         let bad = |_: &Path| Ok("system_id = \"\"".to_string());
+        assert!(run("", bad).is_err());
+        let bad = |_: &Path| Ok("sys_type = \"\"".to_string());
         assert!(run("", bad).is_err());
         let bad = |_: &Path| Ok("colour = blue".to_string());
         assert!(run("", bad).unwrap_err().contains("unknown key"));

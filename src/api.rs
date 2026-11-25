@@ -23,6 +23,10 @@ use crate::registers::{
 };
 use crate::state::{sanitize_name, targets_valid, AppState, MAX_TIMER_MINUTES};
 
+/// Default `system.sysType`: the aircon-only tablet's type, as used by the
+/// MyPlace reference implementation (Home Assistant's fixture has "e-zone").
+pub const DEFAULT_SYS_TYPE: &str = "MyAir5";
+
 /// Names and identity reported to clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiInfo {
@@ -30,6 +34,9 @@ pub struct ApiInfo {
     /// Stable id; Home Assistant uses it as the device's unique id.
     pub system_id: String,
     pub aircon_name: String,
+    /// `system.sysType`. The official app refuses a system whose type it
+    /// does not know ("unable to determine system type").
+    pub sys_type: String,
     /// Zone names, zone 1 first. Missing ones default to "Zone N".
     pub zone_names: Vec<String>,
 }
@@ -40,6 +47,7 @@ impl Default for ApiInfo {
             system_name: "ductbridge".into(),
             system_id: "ductbridge".into(),
             aircon_name: "Aircon".into(),
+            sys_type: DEFAULT_SYS_TYPE.into(),
             zone_names: Vec::new(),
         }
     }
@@ -300,7 +308,7 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
             "rid": info.system_id,
             // The official app ignores a reply without mid, name and myAppRev.
             "mid": info.system_id,
-            "sysType": "ductbridge",
+            "sysType": info.sys_type,
             "myAppRev": my_app_rev(),
             "needsUpdate": false,
             "noOfAircons": 1,
@@ -816,7 +824,7 @@ mod tests {
         assert_eq!(z2["motionConfig"], 2);
         assert_eq!(z2["rssi"], 0x50);
         assert_eq!(d["system"]["rid"], "ductbridge");
-        assert_eq!(d["system"]["sysType"], "ductbridge");
+        assert_eq!(d["system"]["sysType"], "MyAir5");
         assert!(d["myLights"]["lights"].as_object().unwrap().is_empty());
     }
 
@@ -826,10 +834,12 @@ mod tests {
             system_name: "Home".into(),
             system_id: "id1".into(),
             aircon_name: "Ducted".into(),
+            sys_type: "e-zone".into(),
             zone_names: vec!["Living".into(), String::new()],
         };
         let d = sd(&state(), &info).unwrap();
         assert_eq!(d["system"]["name"], "Home");
+        assert_eq!(d["system"]["sysType"], "e-zone");
         assert_eq!(d["aircons"]["ac1"]["info"]["name"], "Ducted");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z01"]["name"], "Living");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z02"]["name"], "Zone 2");
