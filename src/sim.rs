@@ -256,12 +256,15 @@ impl SimBox {
 /// [`SimBox`] as a serial-port stand-in for [`bridge::run`](crate::bridge::run).
 pub struct SimLink {
     sim: SimBox,
+    /// Bytes of a frame that did not fit in the caller's last buffer.
+    unread: VecDeque<u8>,
 }
 
 impl SimLink {
     pub fn new() -> Self {
         SimLink {
             sim: SimBox::new(Instant::now()),
+            unread: VecDeque::new(),
         }
     }
 }
@@ -277,14 +280,25 @@ const READ_TIMEOUT: Duration = Duration::from_millis(20);
 
 impl Read for SimLink {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let deadline = Instant::now() + READ_TIMEOUT;
         loop {
-            let now = Instant::now();
-            if let Some(bytes) = self.sim.poll(now) {
-                let n = bytes.len().min(buf.len());
-                buf[..n].copy_from_slice(&bytes[..n]);
+            if self.unread.is_empty() {
+                if let Some(bytes) = self.sim.poll(Instant::now()) {
+                    self.unread.extend(bytes);
+                }
+            }
+            if !self.unread.is_empty() {
+                // Hand out what fits; keep the rest for the next read.
+                let n = self.unread.len().min(buf.len());
+                for (dst, src) in buf.iter_mut().zip(self.unread.drain(..n)) {
+                    *dst = src;
+                }
                 return Ok(n);
             }
+            let now = Instant::now();
             if now >= deadline {
                 return Err(io::ErrorKind::TimedOut.into());
             }
@@ -366,6 +380,28 @@ mod tests {
         assert_eq!(d["aircons"]["ac1"]["info"]["mode"], "heat");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z03"]["value"], 80);
         assert!(h.snapshot().pending.is_empty(), "confirmed and reflected");
+    }
+
+    #[test]
+    fn small_reads_get_whole_frames_across_calls() {
+        let mut link = SimLink::new();
+        // Wait for the first Ping, reading 3 bytes at a time.
+        let mut got = Vec::new();
+        let start = Instant::now();
+        while !got.ends_with(b"</U=db>") {
+            assert!(start.elapsed() < Duration::from_secs(3), "{got:?}");
+            let mut buf = [0u8; 3];
+            match link.read(&mut buf) {
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+            }
+        }
+        assert_eq!(got, encode("Ping"));
+        assert_eq!(
+            link.read(&mut []).unwrap(),
+            0,
+            "empty buffer consumes nothing"
+        );
     }
 
     #[test]

@@ -125,7 +125,7 @@ Safety choices already implemented:
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
 - Milestone 3 (done): HTTP API, then official-app compatibility and the
-  tablet-side features. 124 tests passing; smoke-tested end to end (fake CB
+  tablet-side features. 125 tests passing; smoke-tested end to end (fake CB
   on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
