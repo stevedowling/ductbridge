@@ -92,21 +92,26 @@ pub fn route(
                 }
             }
         }
-        "/setAircon" => {
+        p @ ("/setAircon" | "/setMySystem") => {
+            let name = &p[1..];
             let now = Instant::now();
             let result = handle
                 .submit(now, |st| {
-                    let writes = api::set_aircon(&req.query, st, now)?;
-                    for w in &writes {
+                    let plan = if name == "setAircon" {
+                        api::set_aircon(&req.query, st, now)?
+                    } else {
+                        api::set_my_system(&req.query, st)?
+                    };
+                    for w in &plan.writes {
                         log_info!("API write: {}", crate::describe(w));
                     }
-                    Ok(writes)
+                    Ok(plan)
                 })
                 .map_err(|e| e.to_string());
             if let Err(e) = &result {
-                log_warn!("setAircon refused: {e}");
+                log_warn!("{name} refused: {e}");
             }
-            (200, api::ack("setAircon", &result).to_string())
+            (200, api::ack(name, &result).to_string())
         }
         p @ ("/setLights" | "/setThings") => {
             let name = &p[1..];
@@ -272,6 +277,14 @@ mod tests {
         }
         let (status, d) = get(addr, "/getSystemData");
         assert_eq!(status, 200);
+        // The body is exactly one JSON object: '{' first, '}' last.
+        let req = Request {
+            method: "GET".into(),
+            path: "/getSystemData".into(),
+            query: String::new(),
+        };
+        let (_, body) = route(&req, &h, &ApiInfo::default(), Duration::ZERO);
+        assert!(body.starts_with('{') && body.ends_with('}'), "{body}");
         assert_eq!(d["aircons"]["ac1"]["info"]["state"], "on");
         assert_eq!(d["aircons"]["ac1"]["zones"]["z01"]["value"], 100);
 

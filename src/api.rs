@@ -1,24 +1,27 @@
 //! The wall tablet's local HTTP API (port 2025), as pure functions.
 //!
-//! Shapes follow the aa_interop `docs/tablet_api/README.md` and what Home
-//! Assistant's `advantage_air` integration reads and sends. Names (system,
-//! aircon, zones) are not on the bus — the original tablet stores them — so
-//! they come from configuration.
+//! Shapes follow the aa_interop `docs/tablet_api/README.md`, what Home
+//! Assistant's `advantage_air` integration reads and sends, and observed
+//! behaviour of the official phone app. Names (system, aircon, zones) are
+//! not on the bus — the original tablet stores them — so they come from the
+//! state file (set by clients) or else the config file.
 //!
-//! Tablet-side features (MyAuto, MyTemp, auto fan, night mode, timers, lights
-//! and "things") are not offered: their keys are left out of `getSystemData`
-//! so clients do not expose them, and `setAircon` rejects them.
+//! Tablet-side features (timers, climate control, MyAuto, quiet night) are
+//! state in [`AppState`](crate::state::AppState), run by
+//! [`features`](crate::features). Auto fan, lights and "things" are not
+//! offered: their keys are left out and `setAircon` rejects them.
 
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
-use crate::bridge::BusState;
+use crate::bridge::{BusState, Plan};
 use crate::record::{Record, DEST_CB};
 use crate::registers::{
     decode_error, Firmware, Mode, SystemStatus, ZoneConfig, ZoneInfo, ZoneState, MAX_SET_TEMP,
     MAX_ZONES, MIN_SET_TEMP,
 };
+use crate::state::{sanitize_name, targets_valid, AppState, MAX_TIMER_MINUTES};
 
 /// Names and identity reported to clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,13 +46,35 @@ impl Default for ApiInfo {
 }
 
 impl ApiInfo {
-    fn zone_name(&self, n: u8) -> String {
+    /// Zone name: set by a client (state file), else config, else "Zone N".
+    fn zone_name(&self, app: &AppState, n: u8) -> String {
+        if let Some(s) = app.names.zones.get(&n) {
+            return s.clone();
+        }
         self.zone_names
             .get(n as usize - 1)
             .filter(|s| !s.is_empty())
             .cloned()
             .unwrap_or_else(|| format!("Zone {n}"))
     }
+    fn system_name(&self, app: &AppState) -> String {
+        app.names
+            .system
+            .clone()
+            .unwrap_or_else(|| self.system_name.clone())
+    }
+    fn aircon_name(&self, app: &AppState) -> String {
+        app.names
+            .aircon
+            .clone()
+            .unwrap_or_else(|| self.aircon_name.clone())
+    }
+}
+
+/// App revision reported to clients. The official app reads the number
+/// before the first `.` and only stores the system's `rid` when it is ≥ 13.
+pub fn my_app_rev() -> String {
+    format!("15.0+ductbridge.{}", env!("CARGO_PKG_VERSION"))
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -87,39 +112,39 @@ fn fan_from_name(s: &str) -> Option<u8> {
 const FRESH_AIR_NAMES: [&str; 3] = ["none", "off", "on"];
 
 /// What the bus has told us about the primary aircon, in decoded form.
-struct View<'a> {
-    st: &'a BusState,
-    unit: (u8, u32),
-    now: Instant,
+pub(crate) struct View<'a> {
+    pub(crate) st: &'a BusState,
+    pub(crate) unit: (u8, u32),
+    pub(crate) now: Instant,
 }
 
 impl View<'_> {
-    fn reg(&self, reg: u8, zone: u8) -> Option<&Record> {
+    pub(crate) fn reg(&self, reg: u8, zone: u8) -> Option<&Record> {
         self.st
             .registers
             .get(&(self.unit.0, self.unit.1, reg, zone))
     }
-    fn status(&self) -> Option<(SystemStatus, &Record)> {
+    pub(crate) fn status(&self) -> Option<(SystemStatus, &Record)> {
         let r = self.reg(SystemStatus::REG, 0)?;
         SystemStatus::decode(r).ok().map(|s| (s, r))
     }
-    fn zone(&self, n: u8) -> Option<(ZoneState, &Record)> {
+    pub(crate) fn zone(&self, n: u8) -> Option<(ZoneState, &Record)> {
         let r = self.reg(ZoneState::REG, n)?;
         ZoneState::decode(r).ok().map(|z| (z, r))
     }
     /// Value a new partial write builds on: pending desired value if any,
     /// else the confirmed register.
-    fn desired(&self, reg: u8, zone: u8) -> Option<&Record> {
+    pub(crate) fn desired(&self, reg: u8, zone: u8) -> Option<&Record> {
         self.st
             .desired(&(self.unit.0, self.unit.1, reg, zone), self.now)
     }
-    fn info(&self) -> Option<ZoneInfo> {
+    pub(crate) fn info(&self) -> Option<ZoneInfo> {
         self.reg(ZoneInfo::REG, 0)
             .and_then(|r| ZoneInfo::decode(r).ok())
     }
     /// Number of zones: from register 01 if seen, else the highest zone
     /// number with a register 03.
-    fn zone_count(&self) -> u8 {
+    pub(crate) fn zone_count(&self) -> u8 {
         if let Some(i) = self.info() {
             return i.zones;
         }
@@ -152,7 +177,7 @@ fn missing(v: &View) -> Option<String> {
 }
 
 /// The primary unit and its status, or why the API cannot answer.
-fn view(st: &BusState, now: Instant) -> Result<View<'_>, String> {
+pub(crate) fn view(st: &BusState, now: Instant) -> Result<View<'_>, String> {
     let unit = st.unit.ok_or("no aircon unit seen on the bus yet")?;
     let v = View { st, unit, now };
     if v.status().is_none() {
@@ -186,6 +211,8 @@ fn temp(t: f32) -> Value {
 pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value, String> {
     let v = view(st, now)?;
     let (s, _) = v.status().expect("checked in view");
+    let app = &st.app;
+    let running = crate::features::running(st, now);
     let zi = v.info();
     let error = v
         .reg(0x08, 0)
@@ -205,7 +232,7 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
         zones.insert(
             format!("z{n:02}"),
             json!({
-                "name": info.zone_name(n),
+                "name": info.zone_name(app, n),
                 "number": n,
                 "state": if z.open { "open" } else { "close" },
                 "value": z.percent,
@@ -228,9 +255,14 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
         "aircons": {
             "ac1": {
                 "info": {
-                    "name": info.aircon_name,
+                    "name": info.aircon_name(app),
                     "state": if s.on { "on" } else { "off" },
-                    "mode": mode_name(s.mode),
+                    // MyAuto is a tablet-side mode; the box sees cool/heat.
+                    "mode": if app.my_auto_enabled && app.my_auto_selected {
+                        "myauto"
+                    } else {
+                        mode_name(s.mode)
+                    },
                     "fan": FAN_NAMES[s.fan as usize],
                     "setTemp": temp(s.set_temp),
                     "myZone": s.my_zone,
@@ -240,10 +272,19 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
                     "constant2": consts[1],
                     "constant3": consts[2],
                     "noOfZones": v.zone_count(),
-                    "countDownToOn": 0,
-                    "countDownToOff": 0,
+                    "countDownToOn": app.count_down_to_on,
+                    "countDownToOff": app.count_down_to_off,
                     "airconErrorCode": error,
                     "cbType": cb_type,
+                    "climateControlModeEnabled": app.climate_control_enabled,
+                    "climateControlModeIsRunning": running.climate_control,
+                    "myAutoModeEnabled": app.my_auto_enabled,
+                    "myAutoModeIsRunning": running.my_auto,
+                    "myAutoModeCurrentSetMode": if app.my_auto_cooling { "cool" } else { "heat" },
+                    "myAutoCoolTargetTemp": temp(app.my_auto_cool_target),
+                    "myAutoHeatTargetTemp": temp(app.my_auto_heat_target),
+                    "quietNightModeEnabled": app.quiet_night_enabled,
+                    "quietNightModeIsRunning": running.quiet_night,
                 },
                 "zones": zones,
             }
@@ -251,10 +292,12 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
         "myLights": { "lights": {} },
         "myThings": { "things": {} },
         "system": {
-            "name": info.system_name,
+            "name": info.system_name(app),
             "rid": info.system_id,
+            // The official app ignores a reply without mid, name and myAppRev.
+            "mid": info.system_id,
             "sysType": "ductbridge",
-            "myAppRev": env!("CARGO_PKG_VERSION"),
+            "myAppRev": my_app_rev(),
             "needsUpdate": false,
             "noOfAircons": 1,
             "hasAircons": true,
@@ -338,7 +381,7 @@ fn as_object<'a>(v: &'a Value, what: &str) -> Result<&'a Map<String, Value>, Str
         .ok_or_else(|| format!("{what} must be an object"))
 }
 
-fn write(unit: (u8, u32), register: u8, payload: [u8; 7]) -> Record {
+pub(crate) fn write(unit: (u8, u32), register: u8, payload: [u8; 7]) -> Record {
     Record {
         unit_type: unit.0,
         dest: DEST_CB,
@@ -349,63 +392,188 @@ fn write(unit: (u8, u32), register: u8, payload: [u8; 7]) -> Record {
 }
 
 /// `GET /setAircon?json=…`: turn the request into register writes, merged
-/// over the current register values. All-or-nothing: any unsupported or
-/// out-of-range field rejects the whole request.
+/// over the current register values, and tablet-side state changes (names,
+/// timers, features). All-or-nothing: any unsupported or out-of-range field
+/// rejects the whole request.
 ///
 /// Accepts both `{"aircons":{"ac1":…}}` (documented form) and `{"ac1":…}`
-/// (what the `advantage_air` Python client sends).
+/// (what the `advantage_air` Python client sends), each optionally with
+/// `"system": {"name": …}` to rename the system.
 /// Partial updates build on pending (accepted but unconfirmed) values, so
 /// back-to-back requests do not undo each other; run it inside
 /// [`Handle::submit`](crate::bridge::Handle::submit) for that to hold.
-pub fn set_aircon(query: &str, st: &BusState, now: Instant) -> Result<Vec<Record>, String> {
+pub fn set_aircon(query: &str, st: &BusState, now: Instant) -> Result<Plan, String> {
     let req = json_param(query)?;
     let root = as_object(&req, "request")?;
-    let acs = match root.get("aircons") {
+    let mut app = st.app.clone();
+    let mut plan = Plan::default();
+    let mut acs = Map::new();
+    match root.get("aircons") {
         Some(a) => {
-            if let Some(k) = root.keys().find(|k| *k != "aircons") {
+            if let Some(k) = root
+                .keys()
+                .find(|k| !matches!(k.as_str(), "aircons" | "system"))
+            {
                 return Err(format!("unsupported key {k:?} next to aircons"));
             }
-            as_object(a, "aircons")?
+            acs = as_object(a, "aircons")?.clone();
         }
-        None => root,
-    };
+        None => {
+            for (k, val) in root {
+                if k != "system" {
+                    acs.insert(k.clone(), val.clone());
+                }
+            }
+        }
+    }
+    if let Some(sys) = root.get("system") {
+        rename_system(as_object(sys, "system")?, &mut app)?;
+    }
     let v = view(st, now)?;
-    let mut out = Vec::new();
-    for (ac, body) in acs {
+    for (ac, body) in &acs {
         if ac != "ac1" {
             return Err(format!("unknown aircon {ac:?} (only ac1)"));
         }
         for (part, val) in as_object(body, ac)? {
             match part.as_str() {
-                "info" => out.extend(info_write(&v, as_object(val, "info")?)?),
+                "info" => {
+                    let w = info_write(&v, as_object(val, "info")?, &mut app, &mut plan.log)?;
+                    plan.writes.extend(w);
+                }
                 "zones" => {
                     for (zk, zb) in as_object(val, "zones")? {
-                        out.push(zone_write(&v, zk, as_object(zb, zk)?)?);
+                        let w = zone_write(&v, zk, as_object(zb, zk)?, &mut app)?;
+                        plan.writes.extend(w);
                     }
                 }
                 other => return Err(format!("unsupported section {other:?}")),
             }
         }
     }
-    Ok(out)
+    // A client write to a register quiet night is still changing wins: drop
+    // those steps so a retry can never undo the user's value.
+    if let Some(t) = app.quiet_night_transition.as_mut() {
+        t.steps.retain(|s| {
+            !plan
+                .writes
+                .iter()
+                .any(|w| w.register == s.register && crate::session::key_of(w).3 == s.zone)
+        });
+        if t.steps.is_empty() {
+            app.quiet_night_transition = None;
+        }
+    }
+    if app != st.app {
+        plan.app = Some(app);
+    }
+    Ok(plan)
 }
+
+fn rename_system(fields: &Map<String, Value>, app: &mut AppState) -> Result<(), String> {
+    for (k, val) in fields {
+        match k.as_str() {
+            "name" => app.names.system = Some(sanitize_name(as_str(val, "system name")?)?),
+            other => return Err(format!("unsupported field system.{other}")),
+        }
+    }
+    Ok(())
+}
+
+/// `GET /setMySystem?json=…`: rename the system. Whether the official app
+/// uses this endpoint for that is unverified; accepts `{"name": …}` and
+/// `{"system": {"name": …}}`.
+pub fn set_my_system(query: &str, st: &BusState) -> Result<Plan, String> {
+    let req = json_param(query)?;
+    let root = as_object(&req, "request")?;
+    let fields = match root.get("system") {
+        Some(s) if root.len() == 1 => as_object(s, "system")?,
+        _ => root,
+    };
+    let mut app = st.app.clone();
+    rename_system(fields, &mut app)?;
+    Ok(Plan {
+        log: vec!["setMySystem used to rename the system (unverified endpoint)".into()],
+        app: Some(app),
+        ..Plan::default()
+    })
+}
+
+/// Minutes for an on/off timer: an integer or a numeric string (some
+/// clients send `"0"`), 0–[`MAX_TIMER_MINUTES`].
+fn as_minutes(v: &Value, what: &str) -> Result<u32, String> {
+    let n = match v {
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => v.as_u64(),
+    };
+    n.filter(|&n| n <= MAX_TIMER_MINUTES as u64)
+        .map(|n| n as u32)
+        .ok_or_else(|| format!("{what} must be 0–{MAX_TIMER_MINUTES} minutes"))
+}
+
+fn as_bool(v: &Value, what: &str) -> Result<bool, String> {
+    v.as_bool()
+        .ok_or_else(|| format!("{what} must be true or false"))
+}
+
+fn as_target(v: &Value, what: &str) -> Result<f32, String> {
+    v.as_f64()
+        .map(|t| t as f32)
+        .ok_or_else(|| format!("{what} must be a number"))
+}
+
+/// Feature toggles and targets: applied before the other fields, so a
+/// request can enable MyAuto and select mode "myauto" together.
+const FEATURE_FIELDS: [&str; 5] = [
+    "climateControlModeEnabled",
+    "myAutoModeEnabled",
+    "quietNightModeEnabled",
+    "myAutoCoolTargetTemp",
+    "myAutoHeatTargetTemp",
+];
 
 // Range checks apply to setpoints a client sends. A request that does not
 // change the setpoint resends the box's own current value as it is (zones
 // without a sensor may report 0), since refusing it would block e.g. a mode
 // change.
 
-fn info_write(v: &View, fields: &Map<String, Value>) -> Result<Option<Record>, String> {
-    if fields.is_empty() {
-        return Ok(None);
+fn info_write(
+    v: &View,
+    fields: &Map<String, Value>,
+    app: &mut AppState,
+    log: &mut Vec<String>,
+) -> Result<Option<Record>, String> {
+    // Pass 1: feature toggles and targets.
+    for (k, val) in fields {
+        match k.as_str() {
+            "climateControlModeEnabled" => app.climate_control_enabled = as_bool(val, k)?,
+            "myAutoModeEnabled" => {
+                app.my_auto_enabled = as_bool(val, k)?;
+                if !app.my_auto_enabled {
+                    app.my_auto_selected = false;
+                }
+            }
+            "quietNightModeEnabled" => app.quiet_night_enabled = as_bool(val, k)?,
+            "myAutoCoolTargetTemp" => app.my_auto_cool_target = as_target(val, k)?,
+            "myAutoHeatTargetTemp" => app.my_auto_heat_target = as_target(val, k)?,
+            _ => {}
+        }
     }
+    if !targets_valid(app.my_auto_cool_target, app.my_auto_heat_target) {
+        return Err(format!(
+            "MyAuto targets cool {} / heat {} invalid (cool 20–32, heat 16–28, cool ≥ heat + 4)",
+            app.my_auto_cool_target, app.my_auto_heat_target
+        ));
+    }
+    // Pass 2: everything else.
     let rec = v.desired(SystemStatus::REG, 0).expect("checked in view");
     let cur = SystemStatus::decode(rec).map_err(|e| format!("current status: {e:?}"))?;
     let mut p = rec.payload;
     p[0] = u8::from(cur.on);
     p[1] = cur.mode as u8;
+    let mut touched = false;
     for (k, val) in fields {
         match k.as_str() {
+            k if FEATURE_FIELDS.contains(&k) => continue,
             "state" => {
                 p[0] = match as_str(val, "state")? {
                     "on" => 1,
@@ -415,8 +583,24 @@ fn info_write(v: &View, fields: &Map<String, Value>) -> Result<Option<Record>, S
             }
             "mode" => {
                 let s = as_str(val, "mode")?;
-                p[1] = mode_from_name(s)
-                    .ok_or_else(|| format!("mode {s:?} (cool, heat, vent, dry or auto)"))?;
+                if s == "myauto" {
+                    // Selecting the mode enables the feature (the official
+                    // app may not send myAutoModeEnabled first).
+                    app.my_auto_enabled = true;
+                    // Start in the box's current mode if it is cool or heat.
+                    match p[1] {
+                        1 => app.my_auto_cooling = true,
+                        2 => app.my_auto_cooling = false,
+                        _ => {}
+                    }
+                    app.my_auto_selected = true;
+                    p[1] = if app.my_auto_cooling { 1 } else { 2 };
+                } else {
+                    p[1] = mode_from_name(s).ok_or_else(|| {
+                        format!("mode {s:?} (cool, heat, vent, dry, auto or myauto)")
+                    })?;
+                    app.my_auto_selected = false;
+                }
             }
             "fan" => {
                 let s = as_str(val, "fan")?;
@@ -445,13 +629,42 @@ fn info_write(v: &View, fields: &Map<String, Value>) -> Result<Option<Record>, S
                     s => return Err(format!("freshAirStatus {s:?} (on or off)")),
                 }
             }
+            "name" => {
+                app.names.aircon = Some(sanitize_name(as_str(val, "name")?)?);
+                continue;
+            }
+            // Every assignment, even to the same value, restarts the
+            // timer's minute (via its generation).
+            "countDownToOn" => {
+                app.count_down_to_on = as_minutes(val, k)?;
+                app.count_down_to_on_gen = app.count_down_to_on_gen.wrapping_add(1);
+                continue;
+            }
+            "countDownToOff" => {
+                app.count_down_to_off = as_minutes(val, k)?;
+                app.count_down_to_off_gen = app.count_down_to_off_gen.wrapping_add(1);
+                continue;
+            }
+            "filterCleanStatus" => {
+                if as_minutes(val, k).ok() != Some(0) {
+                    return Err("filterCleanStatus can only be set to 0 (reset)".into());
+                }
+                log.push("filter reset requested; not yet supported on the bus".into());
+                continue;
+            }
             other => return Err(format!("unsupported field info.{other}")),
         }
+        touched = true;
     }
-    Ok(Some(write(v.unit, SystemStatus::REG, p)))
+    Ok(touched.then(|| write(v.unit, SystemStatus::REG, p)))
 }
 
-fn zone_write(v: &View, key: &str, fields: &Map<String, Value>) -> Result<Record, String> {
+fn zone_write(
+    v: &View,
+    key: &str,
+    fields: &Map<String, Value>,
+    app: &mut AppState,
+) -> Result<Option<Record>, String> {
     // Only the canonical keys getSystemData uses ("z01".."z10"): aliases
     // such as "z1" or "z001" would let one request write a zone twice, the
     // later write silently replacing the earlier.
@@ -466,6 +679,7 @@ fn zone_write(v: &View, key: &str, fields: &Map<String, Value>) -> Result<Record
     let mut open = z.open;
     let mut percent = z.percent;
     let mut set = rec.payload[3];
+    let mut touched = false;
     for (k, val) in fields {
         match k.as_str() {
             "state" => {
@@ -482,15 +696,33 @@ fn zone_write(v: &View, key: &str, fields: &Map<String, Value>) -> Result<Record
                     .ok_or("zone value must be 0–100")? as u8;
             }
             "setTemp" => set = as_temp(val, "zone setTemp")?,
+            "name" => {
+                app.names
+                    .zones
+                    .insert(n, sanitize_name(as_str(val, "zone name")?)?);
+                continue;
+            }
+            // The official app sends whole zone objects: "number" must
+            // match the key; "tempSensorClash" is not a change.
+            "number" => {
+                if val.as_u64() != Some(n as u64) {
+                    return Err(format!("zones.{key}.number {val} does not match the zone"));
+                }
+                continue;
+            }
+            "tempSensorClash" => continue,
             other => return Err(format!("unsupported field zones.{key}.{other}")),
         }
+        touched = true;
     }
     // Sensor and measured-temperature bytes are written as zero.
-    Ok(write(
-        v.unit,
-        ZoneState::REG,
-        [n, u8::from(open) << 7 | percent, 0, set, 0, 0, 0],
-    ))
+    Ok(touched.then(|| {
+        write(
+            v.unit,
+            ZoneState::REG,
+            [n, u8::from(open) << 7 | percent, 0, set, 0, 0, 0],
+        )
+    }))
 }
 
 /// The tablet's reply to a set request.
@@ -532,7 +764,12 @@ mod tests {
     }
 
     fn sa(query: &str, st: &BusState) -> Result<Vec<Record>, String> {
-        set_aircon(query, st, Instant::now())
+        set_aircon(query, st, Instant::now()).map(|p| p.writes)
+    }
+
+    /// Plan for a raw JSON body (wrapped as `json=…`); panics on rejection.
+    fn plan(json: &str, st: &BusState) -> Plan {
+        set_aircon(&q(json), st, Instant::now()).unwrap_or_else(|e| panic!("{json}: {e}"))
     }
 
     fn q(json: &str) -> String {
@@ -552,8 +789,11 @@ mod tests {
         assert_eq!(info["constant1"], 1);
         assert_eq!(info["cbType"], 3);
         assert_eq!(info["countDownToOff"], 0);
-        // Tablet-only features are absent, so clients don't offer them.
-        assert!(info.get("myAutoModeEnabled").is_none());
+        // Implemented tablet-side features are present; auto fan is not.
+        assert_eq!(info["myAutoModeEnabled"], false);
+        assert_eq!(info["climateControlModeEnabled"], false);
+        assert_eq!(info["quietNightModeEnabled"], false);
+        assert_eq!(info["myAutoCoolTargetTemp"], 24.0);
         assert!(info.get("aaAutoFanModeEnabled").is_none());
         let z1 = &d["aircons"]["ac1"]["zones"]["z01"];
         assert_eq!(
@@ -645,7 +885,9 @@ mod tests {
         let later = Instant::now() + crate::bridge::OFFLINE_WIRED;
         let e = system_data(&st, &ApiInfo::default(), later).unwrap_err();
         assert!(e.contains("offline"), "{e}");
-        let e = set_aircon(&q(r#"{"ac1":{"info":{"state":"off"}}}"#), &st, later).unwrap_err();
+        let e = set_aircon(&q(r#"{"ac1":{"info":{"state":"off"}}}"#), &st, later)
+            .map(|p| p.writes)
+            .unwrap_err();
         assert!(e.contains("offline"), "{e}");
     }
 
@@ -653,7 +895,9 @@ mod tests {
     fn partial_updates_build_on_pending_values() {
         let mut st = state();
         let now = Instant::now();
-        let w = set_aircon(&q(r#"{"ac1":{"info":{"state":"off"}}}"#), &st, now).unwrap();
+        let w = set_aircon(&q(r#"{"ac1":{"info":{"state":"off"}}}"#), &st, now)
+            .map(|p| p.writes)
+            .unwrap();
         st.pending.insert(
             crate::session::key_of(&w[0]),
             crate::bridge::Pending {
@@ -663,7 +907,9 @@ mod tests {
                 confirmed: false,
             },
         );
-        let w2 = set_aircon(&q(r#"{"ac1":{"info":{"mode":"heat"}}}"#), &st, now).unwrap();
+        let w2 = set_aircon(&q(r#"{"ac1":{"info":{"mode":"heat"}}}"#), &st, now)
+            .map(|p| p.writes)
+            .unwrap();
         // Off from the first request is kept.
         assert_eq!(w2[0].to_string(), "0701abcde0500020330000100");
         // getSystemData still shows the confirmed value.
@@ -671,7 +917,7 @@ mod tests {
         assert_eq!(d["aircons"]["ac1"]["info"]["state"], "on");
         // A stale pending value is ignored.
         let late = now + crate::bridge::PENDING_TTL;
-        let w3 = set_aircon(&q(r#"{"ac1":{"info":{"mode":"heat"}}}"#), &st, late);
+        let w3 = set_aircon(&q(r#"{"ac1":{"info":{"mode":"heat"}}}"#), &st, late).map(|p| p.writes);
         // (unit offline by then only if past 80 s; PENDING_TTL is 30 s)
         assert_eq!(w3.unwrap()[0].to_string(), "0701abcde0501020330000100");
     }
@@ -743,16 +989,29 @@ mod tests {
         for (json, needle) in [
             (r#"{"ac1":{"info":{"setTemp":33}}}"#, "outside"),
             (r#"{"ac1":{"info":{"setTemp":"24"}}}"#, "number"),
-            (r#"{"ac1":{"info":{"mode":"myauto"}}}"#, "mode"),
             (r#"{"ac1":{"info":{"fan":"off"}}}"#, "fan"),
+            (r#"{"ac1":{"info":{"countDownToOff":721}}}"#, "0–720"),
+            (r#"{"ac1":{"info":{"countDownToOn":"soon"}}}"#, "0–720"),
+            (r#"{"ac1":{"info":{"countDownToOn":-1}}}"#, "0–720"),
+            (r#"{"ac1":{"info":{"myAutoCoolTargetTemp":21}}}"#, "targets"),
             (
-                r#"{"ac1":{"info":{"countDownToOff":10}}}"#,
-                "unsupported field info.countDownToOff",
+                r#"{"ac1":{"info":{"myAutoModeEnabled":"yes"}}}"#,
+                "true or false",
             ),
             (
-                r#"{"ac1":{"info":{"myAutoModeEnabled":true}}}"#,
+                r#"{"ac1":{"info":{"aaAutoFanModeEnabled":true}}}"#,
                 "unsupported",
             ),
+            (
+                r#"{"ac1":{"info":{"filterCleanStatus":1}}}"#,
+                "only be set to 0",
+            ),
+            (r#"{"ac1":{"info":{"name":"  "}}}"#, "empty"),
+            (
+                r#"{"ac1":{"zones":{"z01":{"number":2}}}}"#,
+                "does not match",
+            ),
+            (r#"{"system":{"rid":"x"}}"#, "unsupported field system.rid"),
             (r#"{"ac2":{"info":{"state":"on"}}}"#, "unknown aircon"),
             (r#"{"ac1":{"zones":{"z03":{"value":50}}}}"#, "unknown zone"),
             // Aliases of z01 are refused, so a zone cannot be written twice.
@@ -764,7 +1023,7 @@ mod tests {
             ),
             (r#"{"ac1":{"zones":{"z+1":{"value":50}}}}"#, "unknown zone"),
             (r#"{"ac1":{"zones":{"z01":{"value":101}}}}"#, "0–100"),
-            (r#"{"ac1":{"zones":{"z01":{"name":"x"}}}}"#, "unsupported"),
+            (r#"{"ac1":{"zones":{"z01":{"motion":1}}}}"#, "unsupported"),
             // All-or-nothing: a good field does not rescue a bad one.
             (
                 r#"{"ac1":{"info":{"state":"on"},"zones":{"z09":{"value":5}}}}"#,
@@ -780,6 +1039,186 @@ mod tests {
             assert!(e.contains(needle), "{json}: {e}");
         }
         assert!(sa("x=1", &st).unwrap_err().contains("missing json"));
+    }
+
+    #[test]
+    fn discovery_fields_for_the_official_app() {
+        let d = sd(&state(), &ApiInfo::default()).unwrap();
+        let sys = &d["system"];
+        for k in ["mid", "name", "myAppRev"] {
+            assert!(sys[k].is_string(), "system.{k} missing: {sys}");
+        }
+        assert_eq!(sys["mid"], "ductbridge");
+        let rev = sys["myAppRev"].as_str().unwrap();
+        let major: u32 = rev.split('.').next().unwrap().parse().unwrap();
+        assert_eq!(major, 15);
+        assert!(rev.ends_with(env!("CARGO_PKG_VERSION")), "{rev}");
+    }
+
+    #[test]
+    fn app_shaped_zone_payload_is_accepted() {
+        // The official app sends whole zone objects, setTemp as a float.
+        let w = sa(
+            &q(r#"{"ac1":{"zones":{"z02":{"number":2,"tempSensorClash":false,"state":"open","setTemp":23.0}}}}"#),
+            &state(),
+        )
+        .unwrap();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].to_string(), "0701abcde0302b2002e000000");
+        // Only extras, no change: no write at all.
+        let w = sa(
+            &q(r#"{"ac1":{"zones":{"z01":{"number":1,"tempSensorClash":false}}}}"#),
+            &state(),
+        )
+        .unwrap();
+        assert!(w.is_empty());
+        let w = sa(&q(r#"{"ac1":{"info":{"setTemp":24.0}}}"#), &state()).unwrap();
+        assert_eq!(w[0].payload[3], 48);
+    }
+
+    #[test]
+    fn timers_accept_numbers_and_numeric_strings() {
+        let p = plan(
+            r#"{"ac1":{"info":{"countDownToOff":"30","countDownToOn":0}}}"#,
+            &state(),
+        );
+        assert!(p.writes.is_empty());
+        let app = p.app.unwrap();
+        assert_eq!((app.count_down_to_off, app.count_down_to_on), (30, 0));
+        let mut st = state();
+        st.app = app;
+        let d = sd(&st, &ApiInfo::default()).unwrap();
+        assert_eq!(d["aircons"]["ac1"]["info"]["countDownToOff"], 30);
+        // Setting one does not clear the other (unverified).
+        let app = plan(r#"{"ac1":{"info":{"countDownToOn":5}}}"#, &st)
+            .app
+            .unwrap();
+        assert_eq!((app.count_down_to_on, app.count_down_to_off), (5, 30));
+    }
+
+    #[test]
+    fn renames_override_config_names() {
+        let info = ApiInfo {
+            zone_names: vec!["Living".into(), "Bed".into()],
+            ..ApiInfo::default()
+        };
+        let mut st = state();
+        let p = plan(
+            r#"{"system":{"name":"Home\u0007"},"ac1":{"info":{"name":"Ducted"},"zones":{"z02":{"name":"Study"}}}}"#,
+            &st,
+        );
+        assert!(p.writes.is_empty());
+        st.app = p.app.unwrap();
+        let d = sd(&st, &info).unwrap();
+        assert_eq!(d["system"]["name"], "Home");
+        assert_eq!(d["aircons"]["ac1"]["info"]["name"], "Ducted");
+        assert_eq!(d["aircons"]["ac1"]["zones"]["z01"]["name"], "Living");
+        assert_eq!(d["aircons"]["ac1"]["zones"]["z02"]["name"], "Study");
+        // Wrapped form with system, and setMySystem.
+        let p = plan(r#"{"aircons":{},"system":{"name":"Flat"}}"#, &st);
+        assert_eq!(p.app.unwrap().names.system.as_deref(), Some("Flat"));
+        for body in [r#"{"name":"Unit 2"}"#, r#"{"system":{"name":"Unit 2"}}"#] {
+            let p = set_my_system(&q(body), &st).unwrap();
+            assert_eq!(p.app.unwrap().names.system.as_deref(), Some("Unit 2"));
+            assert!(p.log[0].contains("unverified"));
+        }
+        assert!(sa(
+            &q(&format!(
+                r#"{{"ac1":{{"info":{{"name":"{}"}}}}}}"#,
+                "x".repeat(33)
+            )),
+            &st
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn filter_reset_is_accepted_as_a_no_op() {
+        for v in ["0", "\"0\""] {
+            let p = plan(
+                &format!(r#"{{"ac1":{{"info":{{"filterCleanStatus":{v}}}}}}}"#),
+                &state(),
+            );
+            assert!(p.writes.is_empty() && p.app.is_none());
+            assert_eq!(
+                p.log,
+                ["filter reset requested; not yet supported on the bus"]
+            );
+        }
+    }
+
+    #[test]
+    fn myauto_is_a_tablet_side_mode() {
+        let mut st = state(); // on, cool
+        let p = plan(
+            r#"{"ac1":{"info":{"myAutoModeEnabled":true,"mode":"myauto","myAutoCoolTargetTemp":25,"myAutoHeatTargetTemp":19}}}"#,
+            &st,
+        );
+        // The box only ever sees cool or heat.
+        assert_eq!(p.writes[0].payload[1], 1);
+        st.app = p.app.unwrap();
+        assert!(st.app.my_auto_selected && st.app.my_auto_cooling);
+        let d = sd(&st, &ApiInfo::default()).unwrap();
+        let info = &d["aircons"]["ac1"]["info"];
+        assert_eq!(info["mode"], "myauto");
+        assert_eq!(info["myAutoModeCurrentSetMode"], "cool");
+        assert_eq!(info["myAutoModeIsRunning"], true);
+        assert_eq!(info["myAutoCoolTargetTemp"], 25.0);
+        // Another mode leaves MyAuto.
+        let app = plan(r#"{"ac1":{"info":{"mode":"heat"}}}"#, &st)
+            .app
+            .unwrap();
+        assert!(!app.my_auto_selected);
+        // Disabling it too.
+        let app = plan(r#"{"ac1":{"info":{"myAutoModeEnabled":false}}}"#, &st)
+            .app
+            .unwrap();
+        assert!(!app.my_auto_selected);
+        // Selecting mode myauto alone enables it (the official app may not
+        // send myAutoModeEnabled first).
+        let app = plan(r#"{"ac1":{"info":{"mode":"myauto"}}}"#, &state())
+            .app
+            .unwrap();
+        assert!(app.my_auto_enabled && app.my_auto_selected);
+    }
+
+    #[test]
+    fn client_writes_drop_quiet_night_steps_for_those_registers() {
+        use crate::state::{Step, Transition};
+        let mut st = state();
+        st.app.quiet_night_transition = Some(Transition {
+            steps: vec![
+                Step {
+                    register: 3,
+                    zone: 2,
+                    target: [2, 0x32, 0, 32, 0, 0, 0],
+                    from: [2, 0x32, 1, 48, 21, 3, 0],
+                },
+                Step {
+                    register: 5,
+                    zone: 0,
+                    target: [1, 3, 3, 32, 0, 1, 0],
+                    from: [1, 1, 3, 48, 0, 1, 0],
+                },
+            ],
+            attempts: 1,
+            restore: false,
+        });
+        // The user sets zone 2 back to 24 °C: quiet night must not retry 16 °C.
+        let app = plan(r#"{"ac1":{"zones":{"z02":{"setTemp":24}}}}"#, &st)
+            .app
+            .unwrap();
+        let steps = app.quiet_night_transition.unwrap().steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].register, 5);
+        // A status write drops the last step: transition gone.
+        st.app.quiet_night_transition = Some(Transition {
+            steps,
+            attempts: 1,
+            restore: false,
+        });
+        let app = plan(r#"{"ac1":{"info":{"fan":"low"}}}"#, &st).app.unwrap();
+        assert!(app.quiet_night_transition.is_none());
     }
 
     #[test]

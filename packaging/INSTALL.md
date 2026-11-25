@@ -105,13 +105,29 @@ address and port 2025. Give the Pi a fixed address (DHCP reservation) first.
 In listen-only mode the API is read-only: `setAircon` answers
 `{"ack": false, "reason": "ductbridge is in listen-only mode"}`.
 
-Not supported yet: MyAuto, MyTemp, auto-fan and night-mode presets,
-on/off timers, lights and "things". They are left out of `getSystemData`,
-so Home Assistant does not offer them.
+Supported tablet-side features (run by ductbridge, settings kept in
+`/var/lib/ductbridge/state.json`): renaming the system, aircon and zones from
+the app; on/off timers; climate control (automatic MyZone); MyAuto; quiet
+night mode (22:00–06:00 by the Pi's clock: check `timedatectl` shows NTP on
+and the right time zone). The Pi has no battery-backed clock, so quiet night
+only starts once NTP has synchronised the clock; until then the log says
+"clock not synchronised". Everything else works without internet access. Not supported: auto-fan, lights and "things".
 
-```bash
-sudo systemctl stop ductbridge
-```
+## 8. Verify on install day
+
+These behaviours come from analysis of the app and the original tablet and
+have not been confirmed on a real system. Each logs a line containing
+"unverified" when it acts; check the journal and compare with the original
+tablet where you can:
+
+- Setting one on/off timer leaves the other one running.
+- `setMySystem` is how the app renames the system.
+- MyAuto, zones both too hot and too cold: it stays in its current mode.
+- Quiet night starts when the unit is on and cooling inside the window.
+- Quiet night end restores the settings and leaves the unit on/off as it is
+  (the original may turn the unit off).
+- Filter reset: capture what the original tablet sends when you reset the
+  filter, so it can be implemented (currently accepted and ignored).
 
 ## Troubleshooting
 

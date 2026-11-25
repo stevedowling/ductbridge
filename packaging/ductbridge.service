@@ -11,6 +11,9 @@ RestartSec=5
 User=ductbridge
 Group=ductbridge
 SupplementaryGroups=dialout
+# /var/lib/ductbridge for the state file (names, timers, features),
+# writable despite ProtectSystem=strict.
+StateDirectory=ductbridge
 
 # Hardening. The daemon only needs the serial port and (from milestone 3)
 # a TCP listener.

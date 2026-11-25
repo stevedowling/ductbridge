@@ -26,6 +26,7 @@ use crate::frame::{encode, Decoder, DecoderStats, Frame};
 use crate::record::{parse_list, Record, DEST_CB, UNIT_AIRCON_RF};
 use crate::registers::{SystemStatus, ZoneConfig, ZoneInfo, ZoneState};
 use crate::session::{key_of, Event, Phase, RegKey, Session, TaggedWrite};
+use crate::state::AppState;
 use crate::{log_debug, log_info, log_warn};
 
 /// The original tablet writes at most 63 bytes at a time.
@@ -107,7 +108,32 @@ pub struct BusState {
     pub pending: HashMap<RegKey, Pending>,
     /// Sequence number of the last accepted submission.
     pub(crate) last_seq: u64,
+    /// Tablet-side state (names, timers, features), persisted by the daemon.
+    pub app: AppState,
+    /// Bumped on every change to `app`, so the daemon knows when to save
+    /// and re-evaluate the features.
+    pub app_version: u64,
     pub stats: Stats,
+}
+
+/// What a request or feature evaluation wants done: register writes, and
+/// optionally a new tablet-side state. Applied all-or-nothing by
+/// [`Handle::submit`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Plan {
+    pub writes: Vec<Record>,
+    pub app: Option<AppState>,
+    /// Lines to log at info level once the plan is applied.
+    pub log: Vec<String>,
+}
+
+impl From<Vec<Record>> for Plan {
+    fn from(writes: Vec<Record>) -> Self {
+        Plan {
+            writes,
+            ..Plan::default()
+        }
+    }
 }
 
 /// The latest accepted submission for a register. Every submission gets a
@@ -164,6 +190,8 @@ impl BusState {
             first_seen: HashMap::new(),
             pending: HashMap::new(),
             last_seq: 0,
+            app: AppState::default(),
+            app_version: 0,
             stats: Stats::default(),
         }
     }
@@ -285,22 +313,37 @@ impl Handle {
     /// Queue a register write for the next free slot. The session merges
     /// writes to the same register and resends until confirmed.
     pub fn queue_write(&self, r: Record) -> Result<(), WriteError> {
-        self.submit(Instant::now(), |_| Ok(vec![r]))
+        self.submit(Instant::now(), |_| Ok(vec![r].into()))
             .map_err(|e| match e {
                 SubmitError::Write(w) => w,
                 SubmitError::Rejected(_) => unreachable!(),
             })
     }
 
-    /// Compute writes from the current state and queue them, all under one
-    /// lock, so concurrent requests see each other's pending values. Nothing
-    /// is queued unless `plan` succeeds and writes are allowed.
+    /// The tablet-side state and its version (bumped on every change).
+    pub fn app(&self) -> (u64, AppState) {
+        let st = lock(&self.state);
+        (st.app_version, st.app.clone())
+    }
+
+    /// Replace the tablet-side state (at startup, from the state file).
+    pub fn set_app(&self, app: AppState) {
+        let mut st = lock(&self.state);
+        st.app = app;
+        st.app_version += 1;
+    }
+
+    /// Compute a plan from the current state and apply it, all under one
+    /// lock, so concurrent requests see each other's pending values and
+    /// state changes. Nothing is applied unless `plan` succeeds and writes
+    /// are allowed (active mode, session Steady), even a plan that only
+    /// changes the tablet-side state.
     pub fn submit<F>(&self, now: Instant, plan: F) -> Result<(), SubmitError>
     where
-        F: FnOnce(&BusState) -> Result<Vec<Record>, String>,
+        F: FnOnce(&BusState) -> Result<Plan, String>,
     {
         let mut st = lock(&self.state);
-        let writes = plan(&st).map_err(SubmitError::Rejected)?;
+        let Plan { writes, app, log } = plan(&st).map_err(SubmitError::Rejected)?;
         let err = |e| Err(SubmitError::Write(e));
         if st.mode == TxMode::ListenOnly {
             return err(WriteError::ListenOnly);
@@ -326,6 +369,15 @@ impl Handle {
                     confirmed: false,
                 },
             );
+        }
+        if let Some(app) = app {
+            if app != st.app {
+                st.app = app;
+                st.app_version += 1;
+            }
+        }
+        for line in log {
+            log_info!("{line}");
         }
         Ok(())
     }
@@ -1206,7 +1258,9 @@ mod tests {
         assert_eq!(e, SubmitError::Rejected("nope".into()));
         let mut bad = flush(7, 1);
         bad.dest = 3;
-        let e = h.submit(t, |_| Ok(vec![flush(7, 2), bad])).unwrap_err();
+        let e = h
+            .submit(t, |_| Ok(vec![flush(7, 2), bad].into()))
+            .unwrap_err();
         assert_eq!(e, SubmitError::Write(WriteError::NotToControlBox));
         assert!(h.snapshot().pending.is_empty());
         assert_eq!(b.on_bytes(&encode("Ping"), t), Some(encode("setCAN ")));
