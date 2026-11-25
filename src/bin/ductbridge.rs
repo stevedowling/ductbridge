@@ -80,7 +80,7 @@ fn controller(handle: Handle, state_file: Option<PathBuf>) {
                 // either way that minute is used. Refused (listen-only or
                 // starting up): it stays due and is retried next second.
                 if r.is_ok() {
-                    timers.ticked(&handle.app().1, due);
+                    timers.ticked(due);
                 }
                 report("timers", r);
             }

@@ -620,12 +620,16 @@ fn info_write(
                 app.names.aircon = Some(sanitize_name(as_str(val, "name")?)?);
                 continue;
             }
+            // Every assignment, even to the same value, restarts the
+            // timer's minute (via its generation).
             "countDownToOn" => {
                 app.count_down_to_on = as_minutes(val, k)?;
+                app.count_down_to_on_gen = app.count_down_to_on_gen.wrapping_add(1);
                 continue;
             }
             "countDownToOff" => {
                 app.count_down_to_off = as_minutes(val, k)?;
+                app.count_down_to_off_gen = app.count_down_to_off_gen.wrapping_add(1);
                 continue;
             }
             "filterCleanStatus" => {

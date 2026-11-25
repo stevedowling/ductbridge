@@ -58,6 +58,9 @@ pub struct Transition {
     pub steps: Vec<Step>,
     /// Evaluations so far; given up after a limit.
     pub attempts: u32,
+    /// Ending quiet night (restoring), else starting it.
+    #[serde(default)]
+    pub restore: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,6 +71,11 @@ pub struct AppState {
     pub count_down_to_on: u32,
     /// Minutes until the unit is turned off; 0 = off.
     pub count_down_to_off: u32,
+    /// Bumped on every client assignment of the on timer (even to the same
+    /// value), so its minute restarts from that moment.
+    pub count_down_to_on_gen: u32,
+    /// Same for the off timer.
+    pub count_down_to_off_gen: u32,
     pub climate_control_enabled: bool,
     pub my_auto_enabled: bool,
     /// The client selected mode "myauto".
@@ -89,6 +97,8 @@ impl Default for AppState {
             names: Names::default(),
             count_down_to_on: 0,
             count_down_to_off: 0,
+            count_down_to_on_gen: 0,
+            count_down_to_off_gen: 0,
             climate_control_enabled: false,
             my_auto_enabled: false,
             my_auto_selected: false,
@@ -193,10 +203,15 @@ impl AppState {
             }
         }
         if let Some(t) = &self.quiet_night_transition {
-            let ok = t
-                .steps
-                .iter()
-                .all(|s| payload_valid(s.register, s.target) && payload_valid(s.register, s.from));
+            // Payloads in range, and the step's zone consistent with them:
+            // a zone step must name the zone both payloads are for.
+            let ok = t.steps.iter().all(|s| {
+                let zone_ok = match s.register {
+                    crate::registers::SystemStatus::REG => s.zone == 0,
+                    _ => s.target[0] == s.zone && s.from[0] == s.zone,
+                };
+                zone_ok && payload_valid(s.register, s.target) && payload_valid(s.register, s.from)
+            });
             if !ok {
                 fixed.push("quiet night transition out of range; discarded".into());
                 self.quiet_night_transition = None;
@@ -342,6 +357,20 @@ mod tests {
         assert!(s.quiet_night_transition.is_none());
         assert!(!s.quiet_night_running);
         assert_eq!(fixed.len(), 3, "{fixed:?}");
+        // In range, but the step names zone 2 while the payloads are zone 1's.
+        let (s, fixed) = AppState::from_json(
+            r#"{"quietNightTransition": {"steps": [{"register": 3, "zone": 2,
+                "target": [1,228,0,32,0,0,0], "from": [1,228,0,48,0,0,0]}], "attempts": 0}}"#,
+        )
+        .unwrap();
+        assert!(s.quiet_night_transition.is_none(), "{fixed:?}");
+        // A status step must use zone 0.
+        let (s, _) = AppState::from_json(
+            r#"{"quietNightTransition": {"steps": [{"register": 5, "zone": 1,
+                "target": [1,3,3,32,0,1,0], "from": [1,1,3,48,0,1,0]}], "attempts": 0}}"#,
+        )
+        .unwrap();
+        assert!(s.quiet_night_transition.is_none());
         // Valid ones are kept.
         let (s, fixed) = AppState::from_json(
             r#"{"quietNightRunning": true,

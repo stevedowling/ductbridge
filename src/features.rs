@@ -140,6 +140,21 @@ pub fn evaluate(st: &BusState, now: Instant, minute: Option<u16>) -> Plan {
     let mut app = st.app.clone();
     let mut plan = Plan::default();
     advance_transition(&v, &mut app, &mut plan);
+    // Stopping (disabled, or the window ended) supersedes an unfinished
+    // start: drop its outstanding writes and restore instead.
+    let stop = app.quiet_night_running
+        && (!app.quiet_night_enabled || minute.map(in_quiet_window) == Some(false));
+    if stop
+        && app
+            .quiet_night_transition
+            .as_ref()
+            .is_some_and(|t| !t.restore)
+    {
+        app.quiet_night_transition = None;
+        plan.writes.clear();
+        plan.log
+            .push("quiet night: stopping before its start completed".into());
+    }
     if app.quiet_night_transition.is_none() {
         quiet_night(&v, &mut app, minute, &mut plan);
     }
@@ -224,6 +239,7 @@ fn advance_transition(v: &View, app: &mut AppState, plan: &mut Plan) {
     app.quiet_night_transition = Some(Transition {
         steps: left,
         attempts: t.attempts,
+        restore: t.restore,
     });
 }
 
@@ -319,7 +335,11 @@ fn quiet_night(v: &View, app: &mut AppState, minute: Option<u16>, plan: &mut Pla
             .push("quiet night: started, fan only until 06:00 (trigger unverified)".into());
     }
     if !steps.is_empty() {
-        app.quiet_night_transition = Some(Transition { steps, attempts: 0 });
+        app.quiet_night_transition = Some(Transition {
+            steps,
+            attempts: 0,
+            restore: !app.quiet_night_running,
+        });
     }
 }
 
@@ -425,60 +445,68 @@ fn my_auto(v: &View, app: &mut AppState, plan: &mut Plan) {
     }
 }
 
-/// Which timers have had a full minute since they were set or last counted.
+/// Which timers have had a full minute since they were set or last counted:
+/// the generation each was due for (see [`AppState::count_down_to_on_gen`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Due {
-    pub on: bool,
-    pub off: bool,
+    pub on: Option<u32>,
+    pub off: Option<u32>,
 }
 
 impl Due {
     pub fn any(self) -> bool {
-        self.on || self.off
+        self.on.is_some() || self.off.is_some()
     }
 }
 
 /// Measures each timer's minutes from when it was set, not from daemon
-/// start, so a 1-minute timer always runs a full minute. A value the clock
-/// did not produce itself (a client set the timer) restarts its minute.
+/// start, so a 1-minute timer always runs a full minute. Every client
+/// assignment (even to the same value) bumps the timer's generation, which
+/// restarts its minute here.
 #[derive(Debug, Clone, Default)]
 pub struct TimerClock {
     elapsed: [u32; 2],
-    seen: [u32; 2],
+    gen: [Option<u32>; 2],
 }
 
 impl TimerClock {
     /// Advance by `secs` of wall time and report which timers are due.
     pub fn advance(&mut self, app: &AppState, secs: u32) -> Due {
-        let values = [app.count_down_to_on, app.count_down_to_off];
-        for (i, &v) in values.iter().enumerate() {
-            if v == 0 {
+        let timers = [
+            (app.count_down_to_on, app.count_down_to_on_gen),
+            (app.count_down_to_off, app.count_down_to_off_gen),
+        ];
+        let mut due = [None; 2];
+        for (i, &(value, gen)) in timers.iter().enumerate() {
+            if value == 0 {
                 self.elapsed[i] = 0;
-                self.seen[i] = 0;
+                self.gen[i] = None;
                 continue;
             }
-            if v != self.seen[i] {
-                self.seen[i] = v;
+            if self.gen[i] != Some(gen) {
+                self.gen[i] = Some(gen);
                 self.elapsed[i] = 0;
             }
             // Capped: a minute that ends while the bus is not ready counts
             // once, as soon as it is ready again.
             self.elapsed[i] = (self.elapsed[i] + secs).min(60);
+            if self.elapsed[i] >= 60 {
+                due[i] = Some(gen);
+            }
         }
         Due {
-            on: values[0] > 0 && self.elapsed[0] >= 60,
-            off: values[1] > 0 && self.elapsed[1] >= 60,
+            on: due[0],
+            off: due[1],
         }
     }
 
     /// Call after `tick_timers` for `due` was applied (or did nothing
-    /// because the bus was not ready): restart those timers' minutes.
-    pub fn ticked(&mut self, app: &AppState, due: Due) {
-        let values = [app.count_down_to_on, app.count_down_to_off];
+    /// because the bus was not ready): restart those timers' minutes, unless
+    /// a client re-armed them meanwhile (then `advance` restarts them).
+    pub fn ticked(&mut self, due: Due) {
         for (i, d) in [due.on, due.off].into_iter().enumerate() {
-            if d {
+            if d.is_some() && self.gen[i] == d {
                 self.elapsed[i] = 0;
-                self.seen[i] = values[i];
             }
         }
     }
@@ -500,7 +528,9 @@ pub fn tick_timers(st: &BusState, now: Instant, due: Due) -> Plan {
     let mut app = app0.clone();
     let mut plan = Plan::default();
     let mut s = p;
-    if due.on && app.count_down_to_on > 0 {
+    // Checked under the submission lock: a timer re-armed since `due` was
+    // computed (different generation) is not counted down now.
+    if due.on == Some(app.count_down_to_on_gen) && app.count_down_to_on > 0 {
         app.count_down_to_on -= 1;
         if app.count_down_to_on == 0 {
             s[0] = 1;
@@ -508,7 +538,7 @@ pub fn tick_timers(st: &BusState, now: Instant, due: Due) -> Plan {
                 .push("timer: countDownToOn reached 0, turning on".into());
         }
     }
-    if due.off && app.count_down_to_off > 0 {
+    if due.off == Some(app.count_down_to_off_gen) && app.count_down_to_off > 0 {
         app.count_down_to_off -= 1;
         if app.count_down_to_off == 0 {
             s[0] = 0;
@@ -586,9 +616,15 @@ mod tests {
 
     const NOON: u16 = 12 * 60;
     const BOTH: Due = Due {
-        on: true,
-        off: true,
+        on: Some(0),
+        off: Some(0),
     };
+
+    /// A client assignment of the off timer (bumps its generation).
+    fn set_off(app: &mut AppState, minutes: u32) {
+        app.count_down_to_off = minutes;
+        app.count_down_to_off_gen = app.count_down_to_off_gen.wrapping_add(1);
+    }
 
     #[test]
     fn a_timer_set_late_in_a_minute_still_runs_a_full_minute() {
@@ -596,24 +632,34 @@ mod tests {
         let mut app = AppState::default();
         // 59 s pass with no timer; then a 1-minute timer is set.
         assert_eq!(clock.advance(&app, 59), Due::default());
-        app.count_down_to_off = 1;
-        assert!(!clock.advance(&app, 1).off, "1 s after setting: not due");
-        assert!(!clock.advance(&app, 58).off);
-        assert!(clock.advance(&app, 1).off, "60 s after setting: due");
+        set_off(&mut app, 1);
+        assert_eq!(clock.advance(&app, 1).off, None, "1 s after setting");
+        assert_eq!(clock.advance(&app, 58).off, None);
+        let due = clock.advance(&app, 1);
+        assert_eq!(due.off, Some(1), "60 s after setting: due");
         // After the tick (value now 0) nothing is due.
         app.count_down_to_off = 0;
-        clock.ticked(
-            &app,
-            Due {
-                on: false,
-                off: true,
-            },
-        );
+        clock.ticked(due);
         assert_eq!(clock.advance(&app, 60), Due::default());
     }
 
     #[test]
-    fn timer_clock_counts_each_minute_and_restarts_when_reset() {
+    fn re_arming_to_the_same_value_restarts_the_minute() {
+        let mut clock = TimerClock::default();
+        let mut app = AppState::default();
+        set_off(&mut app, 1);
+        assert!(!clock.advance(&app, 50).any());
+        // Set to 1 again after 50 s: the value is unchanged, the minute is not.
+        set_off(&mut app, 1);
+        assert!(
+            !clock.advance(&app, 10).any(),
+            "would fire 10 s after re-arming"
+        );
+        assert_eq!(clock.advance(&app, 50).off, Some(2));
+    }
+
+    #[test]
+    fn timer_clock_counts_each_minute_and_long_gaps_once() {
         let mut clock = TimerClock::default();
         let mut app = AppState {
             count_down_to_on: 3,
@@ -621,20 +667,33 @@ mod tests {
             ..AppState::default()
         };
         assert_eq!(clock.advance(&app, 60), BOTH);
-        app.count_down_to_on = 2; // as tick_timers would
+        app.count_down_to_on = 2; // as tick_timers would (same generation)
         app.count_down_to_off = 1;
-        clock.ticked(&app, BOTH);
+        clock.ticked(BOTH);
         assert!(!clock.advance(&app, 30).any());
-        // A client resets the on timer: its minute restarts, off's does not.
-        app.count_down_to_on = 10;
-        let due = clock.advance(&app, 30);
-        assert!(!due.on && due.off);
         // A long gap (bus not ready): each timer is due once, not ten times.
         assert_eq!(clock.advance(&app, 600), BOTH);
-        app.count_down_to_on = 9;
-        app.count_down_to_off = 0;
-        clock.ticked(&app, BOTH);
+        clock.ticked(BOTH);
         assert_eq!(clock.advance(&app, 59), Due::default());
+    }
+
+    #[test]
+    fn a_timer_re_armed_after_due_was_computed_is_not_counted_down() {
+        let zones = [z(1, true, 100, false, 24.0, None)];
+        let mut clock = TimerClock::default();
+        let mut app = AppState::default();
+        set_off(&mut app, 2);
+        let due = clock.advance(&app, 60);
+        assert_eq!(due.off, Some(1));
+        // Before the tick takes the lock, a client sets it to 1 (new gen).
+        set_off(&mut app, 1);
+        let st = bus(&s(true, MODE_COOL, 24.0, 0), &zones, app.clone());
+        let p = tick_timers(&st, Instant::now(), due);
+        assert!(p.writes.is_empty() && p.app.is_none(), "not fired early");
+        clock.ticked(due);
+        // The re-armed timer runs its own full minute.
+        assert!(!clock.advance(&app, 59).any());
+        assert_eq!(clock.advance(&app, 1).off, Some(2));
     }
 
     #[test]
@@ -1084,6 +1143,44 @@ mod tests {
         assert!(evaluate(&st, Instant::now(), Some(QUIET_END + 1))
             .writes
             .is_empty());
+    }
+
+    #[test]
+    fn stopping_supersedes_an_unfinished_start() {
+        let st = bus(&s(true, MODE_COOL, 23.0, 0), &quiet_zones(), quiet());
+        let app = evaluate(&st, Instant::now(), Some(23 * 60)).app.unwrap();
+        assert!(!app.quiet_night_transition.as_ref().unwrap().restore);
+        // Only the status change got through; zones still unchanged, and
+        // nothing pending (dropped). Then 06:00 arrives.
+        let st = BusState {
+            app,
+            ..bus(&s(true, MODE_VENT, 16.0, 0), &quiet_zones(), quiet())
+        };
+        let p = evaluate(&st, Instant::now(), Some(QUIET_END));
+        // No fan-only/16 °C reissue: the restore replaces the start.
+        assert!(p
+            .log
+            .iter()
+            .any(|l| l.contains("stopping before its start completed")));
+        let sw = status_write(&p).unwrap();
+        assert_eq!((sw[1], sw[3]), (MODE_COOL, wire(23.0)));
+        assert!(zone_writes(&p)
+            .iter()
+            .all(|r| r.payload[3] != QUIET_SET_TEMP));
+        let app = p.app.unwrap();
+        assert!(!app.quiet_night_running);
+        assert!(app.quiet_night_transition.unwrap().restore);
+        // Disabling mid-start does the same.
+        let st = bus(&s(true, MODE_COOL, 23.0, 0), &quiet_zones(), quiet());
+        let mut app = evaluate(&st, Instant::now(), Some(23 * 60)).app.unwrap();
+        app.quiet_night_enabled = false;
+        let st = BusState { app, ..st };
+        let p = evaluate(&st, Instant::now(), Some(23 * 60 + 1));
+        assert!(p
+            .writes
+            .iter()
+            .all(|r| r.payload[1] != MODE_VENT || r.register != SystemStatus::REG));
+        assert!(!p.app.unwrap().quiet_night_running);
     }
 
     #[test]
