@@ -125,7 +125,7 @@ Safety choices already implemented:
 - Milestone 1 (done): protocol core and monitor.
 - Milestone 2 (done): `ductbridge` daemon, packaging, CI.
 - Milestone 3 (done): HTTP API, then official-app compatibility and the
-  tablet-side features. 125 tests passing; smoke-tested end to end (fake CB
+  tablet-side features. 126 tests passing; smoke-tested end to end (fake CB
   on a pty + the real `advantage_air` Python client + raw curl).
 - **Nothing has been run against a real control box yet.**
 - Which session dialect the target CB uses is unknown (register-only "CAN2"
@@ -180,7 +180,9 @@ PyPI client. Behaviour worth knowing:
 - Official phone app: discovery needs `system.mid` (= `system_id`), `name`
   and `myAppRev`; `myAppRev` is `15.0+ductbridge.<version>` (the app parses
   the major and wants ≥ 13). Its zone objects carry `number` (must match the
-  key) and `tempSensorClash` (ignored).
+  key) and `tempSensorClash` (ignored). Every aircon needs `info.uid` (the
+  app crashes without it): the unit id as 5 lowercase hex digits, as in the
+  records; unit unknown → 503, never null or empty.
 - Wire↔JSON: mode 1 cool, 2 heat, 3 vent, 4 auto, 5 dry; fan off/low/medium/
   high/auto/autoAA (0–5); fresh air none/off/on (0–2).
 - `setAircon` accepts `{"aircons":{"ac1":…}}` and the Python client's

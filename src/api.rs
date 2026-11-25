@@ -256,6 +256,10 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
             "ac1": {
                 "info": {
                     "name": info.aircon_name(app),
+                    // The official app crashes without it. Same characters
+                    // as the unit id in the register records; view() only
+                    // succeeds once the unit is known, so never empty.
+                    "uid": format!("{:05x}", v.unit.1),
                     "state": if s.on { "on" } else { "off" },
                     // MyAuto is a tablet-side mode; the box sees cool/heat.
                     "mode": if app.my_auto_enabled && app.my_auto_selected {
@@ -1053,6 +1057,44 @@ mod tests {
         let major: u32 = rev.split('.').next().unwrap().parse().unwrap();
         assert_eq!(major, 15);
         assert!(rev.ends_with(env!("CARGO_PKG_VERSION")), "{rev}");
+    }
+
+    fn uids(d: &Value) -> Vec<String> {
+        let acs = d["aircons"].as_object().expect("aircons object");
+        assert!(!acs.is_empty());
+        acs.iter()
+            .map(|(k, ac)| {
+                let uid = ac["info"]["uid"].as_str();
+                let uid = uid.unwrap_or_else(|| panic!("{k}.info.uid missing or not a string"));
+                assert!(
+                    uid.len() == 5
+                        && uid
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "{k}.info.uid {uid:?} is not 5 lowercase hex digits"
+                );
+                uid.to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_aircon_has_a_five_hex_digit_uid() {
+        // The official app crashes ("Uid null") without info.uid.
+        assert_eq!(uids(&sd(&state(), &ApiInfo::default()).unwrap()), ["abcde"]);
+        // Small ids are zero-padded, matching the record's characters 4–8.
+        let t = Instant::now();
+        let st = fed(
+            t,
+            "0703000a10120010100000000 0703000a10501010330000100 0703000a10301e40030000000 0703000a10401006400000000",
+        );
+        assert_eq!(
+            uids(&system_data(&st, &ApiInfo::default(), t).unwrap()),
+            ["000a1"]
+        );
+        // Unit not known yet: 503, never a missing or empty uid.
+        let (_b, h) = Bridge::new(TxMode::ListenOnly, t);
+        assert!(system_data(&h.snapshot(), &ApiInfo::default(), t).is_err());
     }
 
     #[test]

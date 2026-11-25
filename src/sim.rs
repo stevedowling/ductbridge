@@ -352,6 +352,7 @@ mod tests {
         assert_eq!(st.phase, Some(Phase::Steady));
         assert_eq!(st.unit, Some(SIM_UNIT));
         let d = api::system_data(&st, &ApiInfo::default(), t).unwrap();
+        assert_eq!(d["aircons"]["ac1"]["info"]["uid"], "abcde");
         let zones = d["aircons"]["ac1"]["zones"].as_object().unwrap();
         assert_eq!(zones.len(), 4);
         assert_eq!(d["aircons"]["ac1"]["zones"]["z01"]["type"], 1);
