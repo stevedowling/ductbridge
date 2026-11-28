@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use crate::bridge::{BusState, Plan};
-use crate::record::{Record, DEST_CB};
+use crate::record::{Record, DEST_CB, UNIT_AIRCON_RF};
 use crate::registers::{
     decode_error, Firmware, Mode, SystemStatus, ZoneConfig, ZoneInfo, ZoneState, MAX_SET_TEMP,
     MAX_ZONES, MIN_SET_TEMP,
@@ -324,8 +324,16 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
                 "zones": zones,
             }
         },
-        "myLights": { "lights": {} },
-        "myThings": { "things": {} },
+        // Empty, as a tablet with nothing of each kind sends them.
+        "myLights": { "lights": {}, "groups": {}, "groupsOrder": [], "system": {} },
+        "myThings": { "things": {}, "groups": {}, "groupsOrder": [], "system": {} },
+        "myScenes": { "scenes": {}, "scenesOrder": [] },
+        "snapshots": {},
+        "mySensors": { "sensors": {}, "sensorsOrder": [] },
+        "myMonitors": { "monitors": {}, "monitorsOrder": [] },
+        "myView": { "cameras": [], "locks": [] },
+        "myAddOns": { "hueBridges": {}, "hueBridgesOrder": [] },
+        "myGarageRFControllers": { "garageControllers": {}, "garageControllersOrder": [] },
         "system": {
             "name": info.system_name(app),
             "rid": info.system_id,
@@ -342,6 +350,12 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
             "hasThings": false,
             "hasThingsBOG": false,
             "hasThingsLight": false,
+            "hasLocks": false,
+            "drawLightsTab": false,
+            "drawThingsTab": false,
+            "showMeasuredTemp": true,
+            "noOfSnapshots": 0,
+            "splitTypeSystem": v.unit.0 == UNIT_AIRCON_RF,
         }
     }))
 }
@@ -810,6 +824,63 @@ mod tests {
 
     fn q(json: &str) -> String {
         format!("json={json}")
+    }
+
+    #[test]
+    fn system_data_sends_empty_feature_blocks() {
+        let d = sd(&state(), &ApiInfo::default()).unwrap();
+        let groups = json!({"groups": {}, "groupsOrder": [], "system": {}});
+        let mut lights = groups.clone();
+        lights["lights"] = json!({});
+        let mut things = groups;
+        things["things"] = json!({});
+        assert_eq!(d["myLights"], lights);
+        assert_eq!(d["myThings"], things);
+        assert_eq!(d["myScenes"], json!({"scenes": {}, "scenesOrder": []}));
+        assert_eq!(d["snapshots"], json!({}));
+        assert_eq!(d["mySensors"], json!({"sensors": {}, "sensorsOrder": []}));
+        assert_eq!(
+            d["myMonitors"],
+            json!({"monitors": {}, "monitorsOrder": []})
+        );
+        assert_eq!(d["myView"], json!({"cameras": [], "locks": []}));
+        assert_eq!(
+            d["myAddOns"],
+            json!({"hueBridges": {}, "hueBridgesOrder": []})
+        );
+        assert_eq!(
+            d["myGarageRFControllers"],
+            json!({"garageControllers": {}, "garageControllersOrder": []})
+        );
+        let sys = &d["system"];
+        assert_eq!(sys["showMeasuredTemp"], true);
+        assert_eq!(sys["drawLightsTab"], false);
+        assert_eq!(sys["drawThingsTab"], false);
+        assert_eq!(sys["hasLocks"], false);
+        assert_eq!(sys["noOfSnapshots"], 0);
+        assert_eq!(sys["splitTypeSystem"], false);
+    }
+
+    #[test]
+    fn split_system_is_reported() {
+        let recs: Vec<String> = state()
+            .registers
+            .values()
+            .map(|r| {
+                Record {
+                    unit_type: UNIT_AIRCON_RF,
+                    ..*r
+                }
+                .to_string()
+            })
+            .collect();
+        let (mut b, h) = Bridge::new(TxMode::ListenOnly, Instant::now());
+        b.on_bytes(
+            &encode(&format!("getCAN 1 {}", recs.join(" "))),
+            Instant::now(),
+        );
+        let d = sd(&h.snapshot(), &ApiInfo::default()).unwrap();
+        assert_eq!(d["system"]["splitTypeSystem"], true);
     }
 
     #[test]
