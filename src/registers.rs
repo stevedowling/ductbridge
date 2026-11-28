@@ -274,6 +274,7 @@ impl ZoneConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZoneInfo {
     pub zones: u8,
+    pub constant_count: u8,
     pub constant_zones: [u8; 3],
     pub filter_clean: bool,
 }
@@ -289,6 +290,7 @@ impl ZoneInfo {
         }
         Ok(ZoneInfo {
             zones: p[1],
+            constant_count: p[2],
             constant_zones: [p[3], p[4], p[5]],
             filter_clean: p[6] == 1,
         })

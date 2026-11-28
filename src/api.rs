@@ -249,10 +249,10 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
         .reg(0x08, 0)
         .and_then(|r| decode_error(r).ok())
         .unwrap_or_default();
-    let cb_type = v
+    let fw = v
         .reg(Firmware::REG, 0)
-        .and_then(|r| Firmware::decode(r).ok())
-        .map_or(0, |f| f.cb_type);
+        .and_then(|r| Firmware::decode(r).ok());
+    let cb_type = fw.map_or(0, |f| f.cb_type);
 
     let mut zones = Map::new();
     for n in 1..=v.zone_count() {
@@ -307,6 +307,11 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
                     "constant2": consts[1],
                     "constant3": consts[2],
                     "noOfZones": v.zone_count(),
+                    "noOfConstants": zi.map_or(0, |i| i.constant_count),
+                    "cbFWRevMajor": fw.map_or(0, |f| f.major),
+                    "cbFWRevMinor": fw.map_or(0, |f| f.minor),
+                    "rfFWRevMajor": fw.map_or(0, |f| f.rf_major),
+                    "rfSysID": s.rf_sys_id,
                     "countDownToOn": app.count_down_to_on,
                     "countDownToOff": app.count_down_to_off,
                     "airconErrorCode": error,
@@ -850,6 +855,36 @@ mod tests {
         assert_eq!(d["system"]["rid"], "ductbridge");
         assert_eq!(d["system"]["sysType"], "MyAir5");
         assert!(d["myLights"]["lights"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn system_data_reports_firmware_and_constants() {
+        let mut st = state();
+        for rec in [
+            // Firmware 2.3, cb type 5, RF firmware 4.
+            "0703abcde0602030504000000",
+            // Status as in state(), with RF system id 5.
+            "0703abcde0501010330000105",
+            // The count byte says 1 constant zone; it wins over the filled slots.
+            "0703abcde0120020101020001",
+        ] {
+            let r = Record::parse(rec).unwrap();
+            st.registers.insert(crate::session::key_of(&r), r);
+        }
+        let d = sd(&st, &ApiInfo::default()).unwrap();
+        let info = &d["aircons"]["ac1"]["info"];
+        assert_eq!(info["cbFWRevMajor"], 2);
+        assert_eq!(info["cbFWRevMinor"], 3);
+        assert_eq!(info["rfFWRevMajor"], 4);
+        assert_eq!(info["rfSysID"], 5);
+        assert_eq!(info["cbType"], 5);
+        assert_eq!(info["noOfConstants"], 1);
+
+        // No constant zones.
+        let r = Record::parse("0703abcde0120020000000001").unwrap();
+        st.registers.insert(crate::session::key_of(&r), r);
+        let d = sd(&st, &ApiInfo::default()).unwrap();
+        assert_eq!(d["aircons"]["ac1"]["info"]["noOfConstants"], 0);
     }
 
     #[test]
