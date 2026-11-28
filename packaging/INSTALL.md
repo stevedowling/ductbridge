@@ -102,7 +102,7 @@ transmits.
 
 ## 6. Go active
 
-1. Unplug the original tablet.
+1. Copy the original tablet's details into the config first: see [Keep your Home Assistant entities](#keep-your-home-assistant-entities). Then unplug the original tablet.
 2. Set `mode = "active"` in `/etc/ductbridge.conf`.
 3. `sudo systemctl restart ductbridge`
 
@@ -127,8 +127,16 @@ zone's state (a few seconds after start). Set `system_name`, `aircon_name`
 and `zone_names` in `/etc/ductbridge.conf`; the original tablet stored these
 and they are not on the bus.
 
-In Home Assistant, add the **Advantage Air** integration with the Pi's
-address and port 2025. Give the Pi a fixed address (DHCP reservation) first.
+### Keep your Home Assistant entities
+
+Home Assistant builds the unique id of the device and every entity from `system.rid` in `getSystemData` (or `system.mid` when the tablet has no `rid`). Do this while the original tablet is still plugged in, or every entity comes back under a new id and dashboards, automations and history that use the old ones stop working:
+
+1. `curl http://TABLET_ADDRESS:2025/getSystemData` and copy `system.rid` (or `system.mid` if `rid` is empty) into `system_id` in `/etc/ductbridge.conf`. While you are there, copy `system.name`, the aircon's `info.name` and each zone's `name` into `system_name`, `aircon_name` and `zone_names`, and `system.aaServiceRev` into `aa_service_rev`.
+2. Keep the existing **Advantage Air** integration entry; do not add a new one. Give the Pi the tablet's address by moving the tablet's DHCP reservation to the Pi's Ethernet MAC address. Home Assistant cannot change an existing entry's address: adding the integration again stops with "already configured". If you cannot reuse the address, delete the entry and add it again with the Pi's address. The unique ids stay the same because `system_id` matches, but check your dashboards and automations afterwards.
+
+ductbridge also reports `system_id` as `system.mid`, which the original tablet sets to the unit id. Whether the phone app minds the change is not known yet: check that it still finds the system.
+
+For a new setup, add the **Advantage Air** integration with the Pi's address and port 2025. Give the Pi a fixed address (DHCP reservation) first.
 
 In listen-only mode the API is read-only: `setAircon` answers
 `{"ack": false, "reason": "ductbridge is in listen-only mode"}`.
