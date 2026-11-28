@@ -6,6 +6,8 @@ Ethernet, USB-RS485 adapter (FTDI or CH340).
 > Nothing here has been tested against a real control box yet. Keep the
 > original tablet so you can plug it back in.
 
+> The phone app will only work on your home network after the swap, and push alerts stop. Both need Advantage Air's cloud, which only the original tablet is signed in to. Use a VPN to your home network (for example WireGuard or Tailscale) to reach the app from outside.
+
 ## 0. Try it without the hardware (optional)
 
 `--simulate` runs ductbridge against a simulated control box (four zones,

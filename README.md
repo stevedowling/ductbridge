@@ -26,6 +26,10 @@ box.
 | Local HTTP API on port 2025 | Done. `getSystemData` and `setAircon` (aircon on/off, mode, fan, setpoint, MyZone, fresh air; zone open/close, damper %, setpoint). Tested with the `advantage_air` Python client used by Home Assistant; discovery fields for the official phone app |
 | Tablet-side features | Done, persisted in a state file: renaming system/aircon/zones, on/off timers, climate control (automatic MyZone), MyAuto (automatic heat/cool), quiet night mode. Some details unverified: see [INSTALL.md](packaging/INSTALL.md#8-verify-on-install-day). Not offered: auto-fan, lights, things |
 
+## What does not carry over
+
+The original tablet is signed in to Advantage Air's cloud, and ductbridge cannot be. After the swap the phone app only works on your home network, push alerts (filter, errors) stop, and the app no longer shows the outside temperature. To use the app away from home, put the phone on your home network with a VPN (for example WireGuard or Tailscale on the Pi or your router). Home Assistant's own remote access also covers control and notifications.
+
 ## Safety
 
 - The bus cable also carries ~14 V DC. Check pins with a multimeter before
