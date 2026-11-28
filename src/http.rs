@@ -150,7 +150,12 @@ fn handle_conn(mut s: TcpStream, handle: &Handle, info: &ApiInfo, ready_wait: Du
         match parse_request(&buf) {
             Ok(Some(req)) => {
                 log_debug!("http {} {}?{}", req.method, req.path, req.query);
-                break route(&req, handle, info, ready_wait);
+                let reply = route(&req, handle, info, ready_wait);
+                // Logged at info so install day shows which app requests are not supported.
+                if matches!(reply.0, 404 | 405) {
+                    log_info!("http: unsupported request {:?} {:?}", req.method, req.path);
+                }
+                break reply;
             }
             Ok(None) => {}
             Err((status, e)) => break (status, json!({"error": e}).to_string()),
