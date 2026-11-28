@@ -141,6 +141,8 @@ and the right time zone). The Pi has no battery-backed clock, so quiet night
 only starts once NTP has synchronised the clock; until then the log says
 "clock not synchronised". Everything else works without internet access. Not supported: auto-fan, lights and "things".
 
+Pairing a new or replacement temperature sensor is not supported yet. Keep the original tablet: to pair a sensor, stop the service, plug the tablet back in, pair it there, then unplug it and start the service again. The control box holds the pairing, so ductbridge should then show that zone's temperature: check that it does.
+
 ## 8. Verify on install day
 
 These behaviours come from analysis of the app and the original tablet and
