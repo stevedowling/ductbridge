@@ -164,13 +164,13 @@ tablet where you can:
 
 The Pi can be the way in from outside as well. With a VPN running on the Pi, a phone away from home reaches the Pi's port 2025 just as it does on your Wi-Fi. Air-conditioning control never depends on the VPN or the internet: if either is down, the system keeps working at home.
 
-Tailscale is the simplest: it needs no port forwarding on your router. On the Pi, with your home network's range in place of `192.168.1.0/24`:
+Tailscale is the simplest: it needs no port forwarding on your router. It makes the Pi reachable at its usual home address and nothing else on your network. On the Pi, with the Pi's home address in place of `192.168.1.20`:
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
 echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-tailscale.conf
 sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
-sudo tailscale up --advertise-routes=192.168.1.0/24
+sudo tailscale up --advertise-routes=192.168.1.20/32
 ```
 
 Approve the route in the Tailscale admin console, and turn off key expiry for the Pi on its Machines page, or remote access stops without warning when the key expires. Then install Tailscale on each phone and sign in to the same account. The phone can now reach the Pi at its home address.
