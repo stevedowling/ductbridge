@@ -16,6 +16,7 @@
 //! my_app_rev = "15.1548"  # tablet app revision reported to apps
 //! aa_service_rev = "14.118"
 //! zone_names = "Living, Kitchen, Bed 1"   # zone 1 first, comma-separated
+//! advertise_features = true  # false hides climate control, MyAuto, quiet night
 //! ```
 
 use std::io;
@@ -143,6 +144,13 @@ fn set(cfg: &mut Config, key: &str, v: &str) -> Result<(), String> {
                 "true" => true,
                 "false" => false,
                 _ => return Err(format!("simulate {v:?} (true or false)")),
+            }
+        }
+        "advertise_features" => {
+            cfg.api.advertise_features = match v {
+                "true" => true,
+                "false" => false,
+                _ => return Err(format!("advertise_features {v:?} (true or false)")),
             }
         }
         "system_name" => cfg.api.system_name = v.to_string(),
@@ -334,6 +342,11 @@ mod tests {
             (c.api.my_app_rev.as_str(), c.api.aa_service_rev.as_str()),
             ("15.1600", "14.120")
         );
+        let f = |_: &Path| Ok("advertise_features = false".to_string());
+        assert!(!run("", f).unwrap().api.advertise_features);
+        assert!(run("", no_file).unwrap().api.advertise_features);
+        let bad = |_: &Path| Ok("advertise_features = no".to_string());
+        assert!(run("", bad).unwrap_err().contains("advertise_features"));
         let bad = |_: &Path| Ok("colour = blue".to_string());
         assert!(run("", bad).unwrap_err().contains("unknown key"));
     }
