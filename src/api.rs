@@ -43,7 +43,20 @@ pub struct ApiInfo {
     pub aa_service_rev: String,
     /// Zone names, zone 1 first. Missing ones default to "Zone N".
     pub zone_names: Vec<String>,
+    /// Whether to send the climate control, MyAuto and quiet night settings.
+    /// Some original tablets leave them out, and Home Assistant only offers
+    /// those controls when they are sent.
+    pub advertise_features: bool,
 }
+
+/// The `info` keys left out when `advertise_features` is off.
+const FEATURE_KEYS: [&str; 5] = [
+    "climateControlModeEnabled",
+    "myAutoModeEnabled",
+    "myAutoCoolTargetTemp",
+    "myAutoHeatTargetTemp",
+    "quietNightModeEnabled",
+];
 
 impl Default for ApiInfo {
     fn default() -> Self {
@@ -55,6 +68,7 @@ impl Default for ApiInfo {
             my_app_rev: DEFAULT_MY_APP_REV.into(),
             aa_service_rev: DEFAULT_AA_SERVICE_REV.into(),
             zone_names: Vec::new(),
+            advertise_features: true,
         }
     }
 }
@@ -240,6 +254,19 @@ fn temp(t: f32) -> Value {
 /// `GET /getSystemData`. `Err` means the bus has not delivered enough yet;
 /// the server answers 503 so clients retry instead of caching an empty system.
 pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value, String> {
+    let mut d = all_system_data(st, info, now)?;
+    if !info.advertise_features {
+        let ac = d["aircons"]["ac1"]["info"]
+            .as_object_mut()
+            .expect("built by all_system_data");
+        for key in FEATURE_KEYS {
+            ac.remove(key);
+        }
+    }
+    Ok(d)
+}
+
+fn all_system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value, String> {
     let v = view(st, now)?;
     let (s, _) = v.status().expect("checked in view");
     let app = &st.app;
@@ -862,6 +889,7 @@ mod tests {
             my_app_rev: "15.2000".into(),
             aa_service_rev: "14.200".into(),
             zone_names: vec!["Living".into(), String::new()],
+            advertise_features: true,
         };
         let d = sd(&state(), &info).unwrap();
         assert_eq!(d["system"]["name"], "Home");
@@ -878,6 +906,28 @@ mod tests {
         let (mut b, h) = Bridge::new(TxMode::ListenOnly, t);
         b.on_bytes(&encode(&format!("getCAN 1 {recs}")), t);
         h.snapshot()
+    }
+
+    #[test]
+    fn feature_settings_can_be_hidden() {
+        let info = ApiInfo {
+            advertise_features: false,
+            ..ApiInfo::default()
+        };
+        let d = sd(&state(), &info).unwrap();
+        let ac = &d["aircons"]["ac1"]["info"];
+        for key in [
+            "climateControlModeEnabled",
+            "myAutoModeEnabled",
+            "myAutoCoolTargetTemp",
+            "myAutoHeatTargetTemp",
+            "quietNightModeEnabled",
+        ] {
+            assert!(ac.get(key).is_none(), "{key}");
+        }
+        assert_eq!(ac["quietNightModeIsRunning"], false);
+        let d = sd(&state(), &ApiInfo::default()).unwrap();
+        assert_eq!(d["aircons"]["ac1"]["info"]["myAutoModeEnabled"], false);
     }
 
     #[test]
