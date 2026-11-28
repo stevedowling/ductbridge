@@ -829,17 +829,28 @@ mod tests {
     #[test]
     fn system_data_sends_empty_feature_blocks() {
         let d = sd(&state(), &ApiInfo::default()).unwrap();
-        for block in ["myScenes", "snapshots", "mySensors", "myMonitors", "myView"] {
-            assert!(d[block].is_object(), "{block}");
-        }
-        assert_eq!(d["myScenes"]["scenesOrder"], json!([]));
-        assert_eq!(d["myThings"]["groupsOrder"], json!([]));
-        assert_eq!(d["myLights"]["system"], json!({}));
-        assert_eq!(d["myView"]["locks"], json!([]));
-        assert_eq!(d["myAddOns"]["hueBridges"], json!({}));
+        let groups = json!({"groups": {}, "groupsOrder": [], "system": {}});
+        let mut lights = groups.clone();
+        lights["lights"] = json!({});
+        let mut things = groups;
+        things["things"] = json!({});
+        assert_eq!(d["myLights"], lights);
+        assert_eq!(d["myThings"], things);
+        assert_eq!(d["myScenes"], json!({"scenes": {}, "scenesOrder": []}));
+        assert_eq!(d["snapshots"], json!({}));
+        assert_eq!(d["mySensors"], json!({"sensors": {}, "sensorsOrder": []}));
         assert_eq!(
-            d["myGarageRFControllers"]["garageControllersOrder"],
-            json!([])
+            d["myMonitors"],
+            json!({"monitors": {}, "monitorsOrder": []})
+        );
+        assert_eq!(d["myView"], json!({"cameras": [], "locks": []}));
+        assert_eq!(
+            d["myAddOns"],
+            json!({"hueBridges": {}, "hueBridgesOrder": []})
+        );
+        assert_eq!(
+            d["myGarageRFControllers"],
+            json!({"garageControllers": {}, "garageControllersOrder": []})
         );
         let sys = &d["system"];
         assert_eq!(sys["showMeasuredTemp"], true);
