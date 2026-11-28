@@ -102,7 +102,7 @@ transmits.
 
 ## 6. Go active
 
-1. Unplug the original tablet.
+1. Copy the original tablet's details into the config first: see [Keep your Home Assistant entities](#keep-your-home-assistant-entities). Then unplug the original tablet.
 2. Set `mode = "active"` in `/etc/ductbridge.conf`.
 3. `sudo systemctl restart ductbridge`
 
@@ -127,8 +127,16 @@ zone's state (a few seconds after start). Set `system_name`, `aircon_name`
 and `zone_names` in `/etc/ductbridge.conf`; the original tablet stored these
 and they are not on the bus.
 
-In Home Assistant, add the **Advantage Air** integration with the Pi's
-address and port 2025. Give the Pi a fixed address (DHCP reservation) first.
+### Keep your Home Assistant entities
+
+Home Assistant names the device and every entity after `system.rid` in `getSystemData`. Do this while the original tablet is still plugged in, or every entity comes back under a new id and dashboards, automations and history that use the old ones stop working:
+
+1. `curl http://TABLET_ADDRESS:2025/getSystemData` and copy `system.rid` into `system_id` in `/etc/ductbridge.conf`. While you are there, copy `system.name`, the aircon's `info.name` and each zone's `name` into `system_name`, `aircon_name` and `zone_names`, and `system.aaServiceRev` into `aa_service_rev`.
+2. Keep the existing **Advantage Air** integration entry; do not add a new one. Either give the Pi the tablet's address (DHCP reservation), or change the entry's host to the Pi's address.
+
+ductbridge also reports `system_id` as `system.mid`, which the original tablet sets to the unit id. Whether the phone app minds the change is not known yet: check that it still finds the system.
+
+For a new setup, add the **Advantage Air** integration with the Pi's address and port 2025. Give the Pi a fixed address (DHCP reservation) first.
 
 In listen-only mode the API is read-only: `setAircon` answers
 `{"ack": false, "reason": "ductbridge is in listen-only mode"}`.
