@@ -173,7 +173,7 @@ sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
 sudo tailscale up --advertise-routes=192.168.1.0/24
 ```
 
-Approve the route in the Tailscale admin console, then install Tailscale on each phone and sign in to the same account. The phone can now reach the Pi at its home address.
+Approve the route in the Tailscale admin console, and turn off key expiry for the Pi on its Machines page, or remote access stops without warning when the key expires. Then install Tailscale on each phone and sign in to the same account. The phone can now reach the Pi at its home address.
 
 WireGuard on the Pi works too, but needs a UDP port forwarded on your router and a fixed public address or dynamic DNS.
 
