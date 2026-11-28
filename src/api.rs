@@ -277,6 +277,11 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
                 "motionConfig": zc.map_or(0, |c| c.motion_config),
                 "error": zc.map_or(0, |c| c.error),
                 "rssi": zc.map_or(0, |c| c.rssi),
+                // Zone following and sensor clash detection are tablet
+                // features ductbridge does not have.
+                "following": 0,
+                "followers": [],
+                "tempSensorClash": false,
             }),
         );
     }
@@ -1342,5 +1347,16 @@ mod tests {
             json!({"ack": true, "request": "setAircon"})
         );
         assert_eq!(ack("setAircon", &Err("no".into()))["reason"], "no");
+    }
+
+    #[test]
+    fn zones_report_no_following_and_no_sensor_clash() {
+        let d = sd(&state(), &ApiInfo::default()).unwrap();
+        for z in ["z01", "z02"] {
+            let zone = &d["aircons"]["ac1"]["zones"][z];
+            assert_eq!(zone["following"], 0, "{z}");
+            assert_eq!(zone["followers"], json!([]), "{z}");
+            assert_eq!(zone["tempSensorClash"], false, "{z}");
+        }
     }
 }
