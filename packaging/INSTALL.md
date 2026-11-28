@@ -129,10 +129,10 @@ and they are not on the bus.
 
 ### Keep your Home Assistant entities
 
-Home Assistant names the device and every entity after `system.rid` in `getSystemData`. Do this while the original tablet is still plugged in, or every entity comes back under a new id and dashboards, automations and history that use the old ones stop working:
+Home Assistant builds the unique id of the device and every entity from `system.rid` in `getSystemData` (or `system.mid` when the tablet has no `rid`). Do this while the original tablet is still plugged in, or every entity comes back under a new id and dashboards, automations and history that use the old ones stop working:
 
-1. `curl http://TABLET_ADDRESS:2025/getSystemData` and copy `system.rid` into `system_id` in `/etc/ductbridge.conf`. While you are there, copy `system.name`, the aircon's `info.name` and each zone's `name` into `system_name`, `aircon_name` and `zone_names`, and `system.aaServiceRev` into `aa_service_rev`.
-2. Keep the existing **Advantage Air** integration entry; do not add a new one. Either give the Pi the tablet's address (DHCP reservation), or change the entry's host to the Pi's address.
+1. `curl http://TABLET_ADDRESS:2025/getSystemData` and copy `system.rid` (or `system.mid` if `rid` is empty) into `system_id` in `/etc/ductbridge.conf`. While you are there, copy `system.name`, the aircon's `info.name` and each zone's `name` into `system_name`, `aircon_name` and `zone_names`, and `system.aaServiceRev` into `aa_service_rev`.
+2. Keep the existing **Advantage Air** integration entry; do not add a new one. Give the Pi the tablet's address by moving the tablet's DHCP reservation to the Pi's Ethernet MAC address. Home Assistant cannot change an existing entry's address: adding the integration again stops with "already configured". If you cannot reuse the address, delete the entry and add it again with the Pi's address. The unique ids stay the same because `system_id` matches, but check your dashboards and automations afterwards.
 
 ductbridge also reports `system_id` as `system.mid`, which the original tablet sets to the unit id. Whether the phone app minds the change is not known yet: check that it still finds the system.
 
