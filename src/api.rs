@@ -861,8 +861,8 @@ mod tests {
     fn system_data_reports_firmware_and_constants() {
         let mut st = state();
         for rec in [
-            // Firmware 2.3, cb type 3, RF firmware 4.
-            "0703abcde0602030304000000",
+            // Firmware 2.3, cb type 5, RF firmware 4.
+            "0703abcde0602030504000000",
             // Status as in state(), with RF system id 5.
             "0703abcde0501010330000105",
             // Constant zones 1 and 2.
@@ -877,7 +877,14 @@ mod tests {
         assert_eq!(info["cbFWRevMinor"], 3);
         assert_eq!(info["rfFWRevMajor"], 4);
         assert_eq!(info["rfSysID"], 5);
+        assert_eq!(info["cbType"], 5);
         assert_eq!(info["noOfConstants"], 2);
+
+        // No constant zones.
+        let r = Record::parse("0703abcde0120020100000001").unwrap();
+        st.registers.insert(crate::session::key_of(&r), r);
+        let d = sd(&st, &ApiInfo::default()).unwrap();
+        assert_eq!(d["aircons"]["ac1"]["info"]["noOfConstants"], 0);
     }
 
     #[test]
