@@ -254,6 +254,19 @@ fn temp(t: f32) -> Value {
 /// `GET /getSystemData`. `Err` means the bus has not delivered enough yet;
 /// the server answers 503 so clients retry instead of caching an empty system.
 pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value, String> {
+    let mut d = all_system_data(st, info, now)?;
+    if !info.advertise_features {
+        let ac = d["aircons"]["ac1"]["info"]
+            .as_object_mut()
+            .expect("built by all_system_data");
+        for key in FEATURE_KEYS {
+            ac.remove(key);
+        }
+    }
+    Ok(d)
+}
+
+fn all_system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value, String> {
     let v = view(st, now)?;
     let (s, _) = v.status().expect("checked in view");
     let app = &st.app;
@@ -296,7 +309,7 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
     }
 
     let consts = zi.map_or([0; 3], |i| i.constant_zones);
-    let mut d = json!({
+    Ok(json!({
         "aircons": {
             "ac1": {
                 "info": {
@@ -357,16 +370,7 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
             "hasThingsBOG": false,
             "hasThingsLight": false,
         }
-    });
-    if !info.advertise_features {
-        let ac = d["aircons"]["ac1"]["info"]
-            .as_object_mut()
-            .expect("built above");
-        for key in FEATURE_KEYS {
-            ac.remove(key);
-        }
-    }
-    Ok(d)
+    }))
 }
 
 /// Decode `%XX` escapes and `+`, leaving anything malformed as it is.
@@ -876,28 +880,6 @@ mod tests {
     }
 
     #[test]
-    fn feature_settings_can_be_hidden() {
-        let info = ApiInfo {
-            advertise_features: false,
-            ..ApiInfo::default()
-        };
-        let d = sd(&state(), &info).unwrap();
-        let ac = &d["aircons"]["ac1"]["info"];
-        for key in [
-            "climateControlModeEnabled",
-            "myAutoModeEnabled",
-            "myAutoCoolTargetTemp",
-            "myAutoHeatTargetTemp",
-            "quietNightModeEnabled",
-        ] {
-            assert!(ac.get(key).is_none(), "{key}");
-        }
-        assert_eq!(ac["quietNightModeIsRunning"], false);
-        let d = sd(&state(), &ApiInfo::default()).unwrap();
-        assert_eq!(d["aircons"]["ac1"]["info"]["myAutoModeEnabled"], false);
-    }
-
-    #[test]
     fn names_come_from_config() {
         let info = ApiInfo {
             system_name: "Home".into(),
@@ -924,6 +906,28 @@ mod tests {
         let (mut b, h) = Bridge::new(TxMode::ListenOnly, t);
         b.on_bytes(&encode(&format!("getCAN 1 {recs}")), t);
         h.snapshot()
+    }
+
+    #[test]
+    fn feature_settings_can_be_hidden() {
+        let info = ApiInfo {
+            advertise_features: false,
+            ..ApiInfo::default()
+        };
+        let d = sd(&state(), &info).unwrap();
+        let ac = &d["aircons"]["ac1"]["info"];
+        for key in [
+            "climateControlModeEnabled",
+            "myAutoModeEnabled",
+            "myAutoCoolTargetTemp",
+            "myAutoHeatTargetTemp",
+            "quietNightModeEnabled",
+        ] {
+            assert!(ac.get(key).is_none(), "{key}");
+        }
+        assert_eq!(ac["quietNightModeIsRunning"], false);
+        let d = sd(&state(), &ApiInfo::default()).unwrap();
+        assert_eq!(d["aircons"]["ac1"]["info"]["myAutoModeEnabled"], false);
     }
 
     #[test]
