@@ -307,7 +307,7 @@ pub fn system_data(st: &BusState, info: &ApiInfo, now: Instant) -> Result<Value,
                     "constant2": consts[1],
                     "constant3": consts[2],
                     "noOfZones": v.zone_count(),
-                    "noOfConstants": consts.iter().filter(|&&z| z > 0).count(),
+                    "noOfConstants": zi.map_or(0, |i| i.constant_count),
                     "cbFWRevMajor": fw.map_or(0, |f| f.major),
                     "cbFWRevMinor": fw.map_or(0, |f| f.minor),
                     "rfFWRevMajor": fw.map_or(0, |f| f.rf_major),
@@ -865,7 +865,7 @@ mod tests {
             "0703abcde0602030504000000",
             // Status as in state(), with RF system id 5.
             "0703abcde0501010330000105",
-            // Constant zones 1 and 2.
+            // The count byte says 1 constant zone; it wins over the filled slots.
             "0703abcde0120020101020001",
         ] {
             let r = Record::parse(rec).unwrap();
@@ -878,10 +878,10 @@ mod tests {
         assert_eq!(info["rfFWRevMajor"], 4);
         assert_eq!(info["rfSysID"], 5);
         assert_eq!(info["cbType"], 5);
-        assert_eq!(info["noOfConstants"], 2);
+        assert_eq!(info["noOfConstants"], 1);
 
         // No constant zones.
-        let r = Record::parse("0703abcde0120020100000001").unwrap();
+        let r = Record::parse("0703abcde0120020000000001").unwrap();
         st.registers.insert(crate::session::key_of(&r), r);
         let d = sd(&st, &ApiInfo::default()).unwrap();
         assert_eq!(d["aircons"]["ac1"]["info"]["noOfConstants"], 0);
