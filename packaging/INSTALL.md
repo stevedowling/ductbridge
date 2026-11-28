@@ -6,7 +6,7 @@ Ethernet, USB-RS485 adapter (FTDI or CH340).
 > Nothing here has been tested against a real control box yet. Keep the
 > original tablet so you can plug it back in.
 
-> The phone app will only work on your home network after the swap, and push alerts stop. Both need Advantage Air's cloud, which only the original tablet is signed in to. Use a VPN to your home network (for example WireGuard or Tailscale) to reach the app from outside.
+> The phone app will only work on your home network after the swap, and push alerts stop. Both need Advantage Air's cloud, which only the original tablet is signed in to. To use the app from outside, make the Pi a VPN server: see [9. Use the app away from home](#9-use-the-app-away-from-home).
 
 ## 0. Try it without the hardware (optional)
 
@@ -158,6 +158,26 @@ tablet where you can:
   (the original may turn the unit off).
 - Filter reset: capture what the original tablet sends when you reset the
   filter, so it can be implemented (currently accepted and ignored).
+- With the VPN on and Wi-Fi off, the app still finds and controls the system.
+
+## 9. Use the app away from home
+
+The Pi can be the way in from outside as well. With a VPN running on the Pi, a phone away from home reaches the Pi's port 2025 just as it does on your Wi-Fi. Air-conditioning control never depends on the VPN or the internet: if either is down, the system keeps working at home.
+
+Tailscale is the simplest: it needs no port forwarding on your router. On the Pi, with your home network's range in place of `192.168.1.0/24`:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-tailscale.conf
+sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
+sudo tailscale up --advertise-routes=192.168.1.0/24
+```
+
+Approve the route in the Tailscale admin console, then install Tailscale on each phone and sign in to the same account. The phone can now reach the Pi at its home address.
+
+WireGuard on the Pi works too, but needs a UDP port forwarded on your router and a fixed public address or dynamic DNS.
+
+Not yet known: whether the app finds the system over a VPN by itself, or only once it has seen it on your Wi-Fi. Open the app on your Wi-Fi first, then try it on mobile data with the VPN on.
 
 ## Troubleshooting
 

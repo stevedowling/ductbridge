@@ -28,7 +28,7 @@ box.
 
 ## What does not carry over
 
-The original tablet is signed in to Advantage Air's cloud, and ductbridge cannot be. After the swap the phone app only works on your home network, push alerts (filter, errors) stop, and the app no longer shows the outside temperature. To use the app away from home, put the phone on your home network with a VPN (for example WireGuard or Tailscale on the Pi or your router). Home Assistant's own remote access also covers control and notifications.
+The original tablet is signed in to Advantage Air's cloud, and ductbridge cannot be. After the swap the phone app only works on your home network, push alerts (filter, errors) stop, and the app no longer shows the outside temperature. To use the app away from home, run a VPN server on the Pi so the phone reaches it as if it were at home: see [INSTALL.md](packaging/INSTALL.md#9-use-the-app-away-from-home). Home Assistant's own remote access also covers control and notifications.
 
 ## Safety
 
